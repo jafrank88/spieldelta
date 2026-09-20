@@ -1,3 +1,4 @@
+import csv
 import html
 import json
 import logging
@@ -19,9 +20,13 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = (10, 60)
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-SPIEL_PRODUCTS_URL = os.getenv("SPIEL_PRODUCTS_URL", "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D")
+               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+SPIEL_PRODUCTS_URL = os.getenv("SPIEL_PRODUCTS_URL", "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERNEHMEN%22%2C%22PROGRAMM%22%2C%22HIT%22%2C%22FIRMA%22%2C%22VERLAG%22%2C%22PUBLISHER%22%2C%22MEDIEN%22%2C%22PRESSE%22%2C%22AUSSTELLER%22%2C%22AUSSTELLUNG%22%2C%22MINT%22%2C%22PLATZ%22%2C%22HAUS%22%2C%22SEITEN%22%2C%22ERWARTUNG%22%2C%22WERTUNG%22%2C%22MUSTER_1%22%2C%22MUSTER_2%22%2C%22MUSTER_3%22%2C%22MUSTER_4%22%2C%22MUSTER_5%22%2C%22MUSTER_6%22%2C%22MUSTER_7%22%2C%22SPIELER%22%2C%22ALTER%22%2C%22DAUER%22%2C%22URL%22%5D")
 TABLETOP_TOGETHER_URL = os.getenv("TABLETOP_TOGETHER_URL", "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32")
+TABLETOP_TOGETHER_CSV = os.getenv(
+    "TABLETOP_TOGETHER_CSV",
+    os.path.join(os.path.dirname(__file__), "TabletopTogetherTool.csv"),
+)
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
 
@@ -137,7 +142,31 @@ def extract_tabletop_titles(page):
     return results
 
 
+def load_csv_titles(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if reader.fieldnames is None:
+                return [], "CSV file is empty or missing a header row."
+            results, seen = [], set()
+            for row in reader:
+                if not row:
+                    continue
+                for key in ("name", "title", "game", "NAME", "TITLE", "GAME"):
+                    value = row.get(key)
+                    if value is not None:
+                        add_tabletop_title(results, seen, value)
+                        break
+            logger.info("Loaded %d titles from CSV %s", len(results), path)
+            return (results, None) if results else ([], "CSV file contained no recognizable game titles.")
+    except OSError as exc:
+        return [], f"Could not read CSV file {path}: {exc}"
+
+
 def get_tabletop_together_games():
+    if os.path.exists(TABLETOP_TOGETHER_CSV):
+        return load_csv_titles(TABLETOP_TOGETHER_CSV)
+
     page, error = fetch(TABLETOP_TOGETHER_URL, "text/html,application/xhtml+xml,application/json")
     if error:
         return [], error
@@ -187,12 +216,11 @@ def index():
     tabletop, tabletop_error = cached_data("tabletop", get_tabletop_together_games)
     matches = compare_titles(spiel, tabletop) if spiel and tabletop else []
     template = """
-    <html><head><title>SPIEL Essen vs Tabletop Together</title><style>
-    body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}
-    </style></head><body><h1>SPIEL Essen vs Tabletop Together</h1>
-    {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}{% if tabletop_error %}<div class="warning">Tabletop Together data unavailable: {{ tabletop_error }}</div>{% endif %}
-    <p>SPIEL products: {{ spiel_count }} | Tabletop Together games: {{ tabletop_count }}</p>
-    {% if matches %}<table><tr><th>SPIEL title</th><th>Tabletop Together match</th><th>Status</th><th>Confidence</th></tr>{% for item in matches %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td></tr>{% endfor %}</table>{% endif %}
+    <html><head><title>SPIEL Essen vs CSV</title><style>
+    body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border-radius:4px;margin:10px 0}.good{color:#0a5d1c;background:#eaf7ee;padding:10px;border-radius:4px;margin:10px 0}.meta{margin:10px 0 20px}small{color:#666}</style></head><body><h1>SPIEL Essen vs CSV</h1>
+    {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}{% if tabletop_error %}<div class="warning">CSV data unavailable: {{ tabletop_error }}</div>{% endif %}
+    <div class="meta"><strong>SPIEL products:</strong> {{ spiel_count }} | <strong>CSV titles:</strong> {{ tabletop_count }}</div>
+    {% if matches %}<table><tr><th>SPIEL title</th><th>CSV match</th><th>Status</th><th>Confidence</th></tr>{% for item in matches %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.best_match or '—' }}</td><td>{{ item.status }}</td><td>{{ item.confidence }}</td></tr>{% endfor %}</table>{% else %}<div class="good">No match data was available yet.</div>{% endif %}
     </body></html>"""
     return render_template_string(template, matches=matches, spiel_count=len(spiel), tabletop_count=len(tabletop), spiel_error=spiel_error, tabletop_error=tabletop_error)
 
