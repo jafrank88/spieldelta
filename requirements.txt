@@ -1,4 +1,5 @@
 flask
 requests
 beautifulsoup4
+thefuzz
 gunicorn
