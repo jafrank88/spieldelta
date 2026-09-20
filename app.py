@@ -3,12 +3,13 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import unicodedata
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from thefuzz import fuzz
 
 app = Flask(__name__)
@@ -17,7 +18,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20
-USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.4; +https://github.com/jafrank88/spieldelta)"
+CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
+USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.5; +https://github.com/jafrank88/spieldelta)"
 SPIEL_PRODUCTS_URL = os.getenv(
     "SPIEL_PRODUCTS_URL",
     "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D",
@@ -26,6 +28,9 @@ TABLETOP_TOGETHER_URL = os.getenv(
     "TABLETOP_TOGETHER_URL",
     "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32",
 )
+
+_cache_lock = threading.Lock()
+_cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
 
 
 def normalize_title(value):
@@ -156,7 +161,6 @@ def extract_tabletop_titles(html_text):
 
     if results:
         return results, None
-
     return [], "Tabletop Together share page contained no game rows."
 
 
@@ -169,6 +173,22 @@ def get_tabletop_together_games():
         logger.info("Fetched %d Tabletop Together games from %s", len(games), TABLETOP_TOGETHER_URL)
         return games, None
     return [], parse_error
+
+
+def cached_data(name, loader):
+    now = time.monotonic()
+    with _cache_lock:
+        timestamp, data, error = _cache[name]
+        if now - timestamp < CACHE_TTL and (data or error):
+            return data, error
+
+        data, error = loader()
+        if data:
+            _cache[name] = (time.monotonic(), data, error)
+        else:
+            # Cache failures briefly to prevent health checks from hammering an unavailable source.
+            _cache[name] = (time.monotonic(), data, error)
+        return data, error
 
 
 def compare_titles(spiel_titles, tabletop_titles):
@@ -215,10 +235,19 @@ def compare_titles(spiel_titles, tabletop_titles):
     return results
 
 
-@app.route("/")
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return jsonify(status="ok"), 200
+
+
+@app.route("/", methods=["GET", "HEAD"])
 def index():
-    spiel_titles, spiel_error = get_spiel_novelties()
-    tabletop_titles, tabletop_error = get_tabletop_together_games()
+    # Render and other monitors use HEAD for availability checks. Do not call upstream services for them.
+    if request.method == "HEAD":
+        return "", 200
+
+    spiel_titles, spiel_error = cached_data("spiel", get_spiel_novelties)
+    tabletop_titles, tabletop_error = cached_data("tabletop", get_tabletop_together_games)
     matches = compare_titles(spiel_titles, tabletop_titles) if spiel_titles and tabletop_titles else []
 
     html_template = """
