@@ -1,5 +1,4 @@
 flask
-pandas
 requests
-thefuzz
+beautifulsoup4
 gunicorn
