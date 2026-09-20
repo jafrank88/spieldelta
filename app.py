@@ -1,35 +1,49 @@
+import logging
+
 from flask import Flask, render_template_string
 import requests
 
 app = Flask(__name__)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 REQUEST_TIMEOUT = 20
 
 
-def get_bgg_preview_titles(preview_id=93):
-    """Fetch titles listed in BGG's GeekPreview.
-
-    Return an empty list when the upstream service is unavailable or returns
-    an unexpected response so the page can still render.
-    """
-    url = f"https://boardgamegeek.com/api/geekpreview/items?previewid={preview_id}"
-    headers = {"User-Agent": "spieldelta/1.0"}
-
+def fetch_json(url, headers):
+    """Fetch a URL and return (data, error_message)."""
     try:
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        data = response.json()
-    except (requests.RequestException, ValueError):
-        return []
+        return response.json(), None
+    except requests.RequestException as exc:
+        logger.exception("Request failed for %s: %s", url, exc)
+        return None, f"Could not load data from {url}."
+    except ValueError as exc:
+        logger.exception("Invalid JSON from %s: %s", url, exc)
+        return None, f"The response from {url} was not valid JSON."
+
+
+def get_bgg_preview_titles(preview_id=93):
+    """Fetch titles listed in BGG's GeekPreview."""
+    url = f"https://boardgamegeek.com/api/geekpreview/items?previewid={preview_id}"
+    headers = {"User-Agent": "spieldelta/1.0"}
+    data, error = fetch_json(url, headers)
+    if error or data is None:
+        logger.warning("BGG data unavailable: %s", error)
+        return [], error
 
     if not isinstance(data, dict):
-        return []
+        logger.warning("BGG response was not a dictionary: %s", type(data).__name__)
+        return [], "BGG returned an unexpected response format."
 
     items = data.get("items", [])
     if not isinstance(items, list):
-        return []
+        logger.warning("BGG items field was missing or not a list.")
+        return [], "BGG returned an unexpected response format."
 
-    return [
+    result = [
         {
             "bgg_id": item.get("itemid"),
             "title": str(item.get("itemname") or "").strip(),
@@ -38,28 +52,28 @@ def get_bgg_preview_titles(preview_id=93):
         for item in items
         if isinstance(item, dict)
     ]
+    return result, None
 
 
 def get_spiel_novelties():
     """Fetch titles listed on the official SPIEL Essen novelties portal."""
     url = "https://www.spiel-essen.de/en/api/novelties"
     headers = {"User-Agent": "spieldelta/1.0"}
-
-    try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-    except (requests.RequestException, ValueError):
-        return []
+    data, error = fetch_json(url, headers)
+    if error or data is None:
+        logger.warning("SPIEL data unavailable: %s", error)
+        return [], error
 
     if not isinstance(data, dict):
-        return []
+        logger.warning("SPIEL response was not a dictionary: %s", type(data).__name__)
+        return [], "SPIEL returned an unexpected response format."
 
     items = data.get("data", [])
     if not isinstance(items, list):
-        return []
+        logger.warning("SPIEL data field was missing or not a list.")
+        return [], "SPIEL returned an unexpected response format."
 
-    return [
+    result = [
         {
             "title": str(item.get("title") or "").strip(),
             "publisher": str(item.get("exhibitor") or "").strip(),
@@ -69,12 +83,13 @@ def get_spiel_novelties():
         for item in items
         if isinstance(item, dict)
     ]
+    return result, None
 
 
 @app.route("/")
 def index():
-    bgg_titles = get_bgg_preview_titles()
-    spiel_titles = get_spiel_novelties()
+    bgg_titles, bgg_error = get_bgg_preview_titles()
+    spiel_titles, spiel_error = get_spiel_novelties()
 
     html_template = """
     <html>
@@ -85,10 +100,19 @@ def index():
             table { border-collapse: collapse; width: 100%; }
             th, td { border: 1px solid #ccc; padding: 8px; }
             th { background-color: #f2f2f2; }
+            .warning { color: #8a3b00; background: #fff3e0; padding: 10px; border: 1px solid #ffcc80; margin-bottom: 20px; }
         </style>
     </head>
     <body>
         <h1>SPIEL Essen vs BGG Preview</h1>
+
+        {% if bgg_error %}
+        <div class="warning">BGG data unavailable: {{ bgg_error }}</div>
+        {% endif %}
+        {% if spiel_error %}
+        <div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>
+        {% endif %}
+
         <h2>BGG Titles ({{ bgg_count }})</h2>
         <table>
             <tr><th>ID</th><th>Title</th><th>Publisher</th></tr>
@@ -113,6 +137,8 @@ def index():
         spiel_titles=spiel_titles,
         bgg_count=len(bgg_titles),
         spiel_count=len(spiel_titles),
+        bgg_error=bgg_error,
+        spiel_error=spiel_error,
     )
 
 
