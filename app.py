@@ -50,7 +50,7 @@ def fetch_html(url):
         response.raise_for_status()
         return response.text, None
     except requests.RequestException as exc:
-        logger.exception("Request failed for %s: %s", url, exc)
+        logger.exception("Request failed for %s", url)
         return None, f"Could not load page from {url}."
 
 
@@ -64,7 +64,7 @@ def fetch_json(url):
         response.raise_for_status()
         return response.json(), None
     except (requests.RequestException, ValueError) as exc:
-        logger.exception("JSON request failed for %s: %s", url, exc)
+        logger.exception("JSON request failed for %s", url)
         return None, f"Could not load product data from {url}."
 
 
@@ -236,7 +236,7 @@ def compare_titles(spiel_titles, tablet_titles):
 @app.route("/")
 def index():
     spiel_titles, spiel_error = get_spiel_novelties()
-    tablet_titles, tablet_error = get_tabletop_together_games()
+    tablet_titles, tablet_error = get_tabletopoptogether_games()
     matches = compare_titles(spiel_titles, tablet_titles) if spiel_titles and tablet_titles else []
 
     html_template = """
