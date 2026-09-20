@@ -1,5 +1,8 @@
 import logging
+import re
+from urllib.parse import urljoin
 
+from bs4 import BeautifulSoup
 from flask import Flask, render_template_string
 import requests
 
@@ -9,81 +12,151 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20
+USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.1; +https://github.com/jafrank88/spieldelta)"
+
+STOP_WORDS = {
+    "home",
+    "about",
+    "contact",
+    "news",
+    "events",
+    "login",
+    "signup",
+    "search",
+    "shop",
+    "cart",
+    "privacy",
+    "terms",
+    "menu",
+    "navigation",
+    "more",
+}
 
 
-def fetch_json(url, headers):
-    """Fetch a URL and return (data, error_message)."""
+def normalize_text(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def fetch_html(url):
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return response.json(), None
+        return response.text, None
     except requests.RequestException as exc:
         logger.exception("Request failed for %s: %s", url, exc)
-        return None, f"Could not load data from {url}."
-    except ValueError as exc:
-        logger.exception("Invalid JSON from %s: %s", url, exc)
-        return None, f"The response from {url} was not valid JSON."
+        return None, f"Could not load page from {url}."
+
+
+def collect_candidate_titles(soup, preferred_hints=None):
+    """Best-effort extraction of title-like strings from a page."""
+    preferred_hints = preferred_hints or []
+    seen = set()
+    results = []
+
+    def add_text(value):
+        text = normalize_text(value)
+        if len(text) < 3:
+            return
+        if text.lower() in STOP_WORDS:
+            return
+        if text in seen:
+            return
+        seen.add(text)
+        results.append(text)
+
+    for hint in preferred_hints:
+        add_text(hint)
+
+    for tag in soup.find_all(["a", "h1", "h2", "h3", "h4", "li", "article", "div", "span"]):
+        text = normalize_text(tag.get_text(" ", strip=True))
+        if not text:
+            continue
+        if len(text) < 3:
+            continue
+        lower = text.lower()
+        if lower in STOP_WORDS:
+            continue
+        if lower.startswith("read more"):
+            continue
+        if lower.startswith("show more"):
+            continue
+        if any(x in lower for x in ["login", "signup", "search", "privacy", "terms", "cart", "news"]):
+            continue
+        add_text(text)
+
+    for link in soup.find_all("a", href=True):
+        href = link.get("href", "")
+        text = normalize_text(link.get_text(" ", strip=True))
+        if not text:
+            continue
+        if any(token in href.lower() for token in ["boardgame", "product", "game", "novelty"]) or any(token in text.lower() for token in ["spiel", "preview", "release", "novelty"]):
+            add_text(text)
+
+    return results
 
 
 def get_bgg_preview_titles(preview_id=93):
-    """Fetch titles listed in BGG's GeekPreview."""
-    url = f"https://boardgamegeek.com/api/geekpreview/items?previewid={preview_id}"
-    headers = {"User-Agent": "spieldelta/1.0"}
-    data, error = fetch_json(url, headers)
-    if error or data is None:
-        logger.warning("BGG data unavailable: %s", error)
-        return [], error
-
-    if not isinstance(data, dict):
-        logger.warning("BGG response was not a dictionary: %s", type(data).__name__)
-        return [], "BGG returned an unexpected response format."
-
-    items = data.get("items", [])
-    if not isinstance(items, list):
-        logger.warning("BGG items field was missing or not a list.")
-        return [], "BGG returned an unexpected response format."
-
-    result = [
-        {
-            "bgg_id": item.get("itemid"),
-            "title": str(item.get("itemname") or "").strip(),
-            "publisher": str(item.get("publishername") or "").strip(),
-        }
-        for item in items
-        if isinstance(item, dict)
+    """Best-effort extraction of BGG preview titles from HTML pages."""
+    urls = [
+        f"https://boardgamegeek.com/geekpreview/{preview_id}",
+        f"https://boardgamegeek.com/preview/{preview_id}",
+        "https://boardgamegeek.com/geekpreview",
+        "https://boardgamegeek.com/geekpreview/",
     ]
-    return result, None
+
+    last_error = None
+    for url in urls:
+        html, error = fetch_html(url)
+        if error:
+            last_error = error
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        titles = collect_candidate_titles(soup, preferred_hints=["GeekPreview", "Preview"])
+
+        cleaned = []
+        for title in titles:
+            if "preview" in title.lower() and len(title) < 30:
+                continue
+            cleaned.append({
+                "bgg_id": preview_id,
+                "title": title,
+                "publisher": "",
+            })
+
+        if cleaned:
+            return cleaned, None
+
+    return [], last_error or "BGG preview page could not be parsed."
 
 
 def get_spiel_novelties():
-    """Fetch titles listed on the official SPIEL Essen novelties portal."""
-    url = "https://www.spiel-essen.de/en/api/novelties"
-    headers = {"User-Agent": "spieldelta/1.0"}
-    data, error = fetch_json(url, headers)
-    if error or data is None:
-        logger.warning("SPIEL data unavailable: %s", error)
+    """Best-effort extraction of SPIEL novelties from the public HTML page."""
+    url = "https://spiel-essen.de/en/the-spiel/novelties"
+    html, error = fetch_html(url)
+    if error:
         return [], error
 
-    if not isinstance(data, dict):
-        logger.warning("SPIEL response was not a dictionary: %s", type(data).__name__)
-        return [], "SPIEL returned an unexpected response format."
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = collect_candidate_titles(soup, preferred_hints=["SPIEL", "Novelties", "The Spiel"])
 
-    items = data.get("data", [])
-    if not isinstance(items, list):
-        logger.warning("SPIEL data field was missing or not a list.")
-        return [], "SPIEL returned an unexpected response format."
+    cleaned = []
+    for title in candidates:
+        if any(token in title.lower() for token in ["subscribe", "newsletter", "event", "hall", "booth"]):
+            continue
+        cleaned.append({
+            "title": title,
+            "publisher": "",
+            "hall": "",
+            "booth": "",
+        })
 
-    result = [
-        {
-            "title": str(item.get("title") or "").strip(),
-            "publisher": str(item.get("exhibitor") or "").strip(),
-            "hall": str(item.get("hall") or ""),
-            "booth": str(item.get("booth") or ""),
-        }
-        for item in items
-        if isinstance(item, dict)
-    ]
-    return result, None
+    if cleaned:
+        return cleaned, None
+
+    return [], "SPIEL novelties page could not be parsed."
 
 
 @app.route("/")
