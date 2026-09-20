@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = (10, 60)
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
+SPIEL_CACHE_TTL = int(os.getenv("SPIEL_CACHE_TTL", "900"))
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 SPIEL_PRODUCTS_URL = "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22TITEL%22%5D"
@@ -144,10 +145,10 @@ def missing_from_csv(novelties, csv_titles, fuzzy_threshold=90):
     return missing
 
 
-def cached_data(name, loader):
+def cached_data(name, loader, ttl=CACHE_TTL):
     with _cache_lock:
         timestamp, data, error = _cache[name]
-        if time.monotonic() - timestamp < CACHE_TTL:
+        if time.monotonic() - timestamp < ttl:
             return data, error
         data, error = loader()
         _cache[name] = (time.monotonic(), data, error)
@@ -164,7 +165,7 @@ def index():
     if request.method == "HEAD":
         return "", 200
 
-    spiel, spiel_error = cached_data("spiel", get_spiel_novelties)
+    spiel, spiel_error = cached_data("spiel", get_spiel_novelties, SPIEL_CACHE_TTL)
     csv_titles, csv_error = cached_data("csv", lambda: load_csv_titles(CSV_PATH))
     missing = missing_from_csv(spiel, csv_titles) if spiel and csv_titles else []
 
