@@ -23,6 +23,10 @@ SPIEL_CACHE_TTL = int(os.getenv("SPIEL_CACHE_TTL", "900"))
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 SPIEL_PRODUCTS_URL = "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22TITEL%22%5D"
+SPIEL_PRODUCT_URL_TEMPLATE = os.getenv(
+    "SPIEL_PRODUCT_URL_TEMPLATE",
+    "https://maps.eyeled-services.de/en/spiel26/products/{id}",
+)
 CSV_PATH = os.getenv("TABLETOP_TOGETHER_CSV", os.path.join(os.path.dirname(__file__), "TabletopTogetherTool.csv"))
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "csv": (0.0, [], None)}
@@ -46,6 +50,17 @@ def title_key(value):
 def bgg_search_url(title):
     return ("https://boardgamegeek.com/geeksearch.php?action=search"
             f"&objecttype=boardgame&q={quote_plus(normalize_title(title))}")
+
+
+def spiel_entry_url(item_id):
+    """Build the SPIEL product-detail URL for an API product ID.
+
+    SPIEL_PRODUCT_URL_TEMPLATE can be overridden if the SPIEL site changes its
+    detail-route format; it must contain an {id} placeholder.
+    """
+    if item_id is None or str(item_id).strip() == "":
+        return None
+    return SPIEL_PRODUCT_URL_TEMPLATE.format(id=quote_plus(str(item_id)))
 
 
 def fetch(url, accept):
@@ -127,7 +142,7 @@ def missing_from_csv(novelties, csv_titles, fuzzy_threshold=90):
     for item in novelties:
         key = title_key(item["title"])
         if not key:
-            missing.append({**item, "closest_score": 0, "bgg_url": bgg_search_url(item["title"])})
+            missing.append({**item, "closest_score": 0, "bgg_url": bgg_search_url(item["title"]), "spiel_url": spiel_entry_url(item.get("id"))})
             continue
         if key in csv_keys:
             continue
@@ -141,6 +156,7 @@ def missing_from_csv(novelties, csv_titles, fuzzy_threshold=90):
                 **item,
                 "closest_score": best,
                 "bgg_url": bgg_search_url(item["title"]),
+                "spiel_url": spiel_entry_url(item.get("id")),
             })
     return missing
 
@@ -176,7 +192,7 @@ def index():
     {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
     {% if csv_error %}<div class="warning">CSV data unavailable: {{ csv_error }}</div>{% endif %}
     <div class="meta"><strong>SPIEL novelties:</strong> {{ spiel_count }} | <strong>CSV titles:</strong> {{ csv_count }} | <strong>Missing:</strong> {{ missing_count }}</div>
-    {% if missing %}<table><tr><th>SPIEL title</th><th>ID</th><th>Closest CSV score</th><th>BGG</th></tr>{% for item in missing %}<tr><td>{{ item.title }}</td><td>{{ item.id or '—' }}</td><td>{{ item.closest_score }}</td><td><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">Search BGG</a></td></tr>{% endfor %}</table>{% elif not spiel_error and not csv_error %}<p>No unmatched novelties found.</p>{% endif %}
+    {% if missing %}<table><tr><th>SPIEL title</th><th>ID</th><th>Closest CSV score</th><th>BGG</th></tr>{% for item in missing %}<tr><td>{{ item.title }}</td><td>{% if item.spiel_url %}<a href="{{ item.spiel_url }}" target="_blank" rel="noopener">{{ item.id }}</a>{% else %}—{% endif %}</td><td>{{ item.closest_score }}</td><td><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">Search BGG</a></td></tr>{% endfor %}</table>{% elif not spiel_error and not csv_error %}<p>No unmatched novelties found.</p>{% endif %}
     </body></html>"""
     return render_template_string(
         template,
