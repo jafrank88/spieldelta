@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import unicodedata
+from urllib.parse import quote_plus
 
 import requests
 from flask import Flask, jsonify, render_template_string, request
@@ -39,6 +40,11 @@ def title_key(value):
     value = normalize_title(value).casefold().replace("&", " and ")
     value = re.sub(r"[^a-z0-9]+", " ", value)
     return " ".join(word for word in value.split() if word not in {"a", "an", "the"})
+
+
+def bgg_search_url(title):
+    return ("https://boardgamegeek.com/geeksearch.php?action=search"
+            f"&objecttype=boardgame&q={quote_plus(normalize_title(title))}")
 
 
 def fetch(url, accept):
@@ -120,7 +126,7 @@ def missing_from_csv(novelties, csv_titles, fuzzy_threshold=90):
     for item in novelties:
         key = title_key(item["title"])
         if not key:
-            missing.append({**item, "closest_score": 0})
+            missing.append({**item, "closest_score": 0, "bgg_url": bgg_search_url(item["title"])})
             continue
         if key in csv_keys:
             continue
@@ -130,7 +136,11 @@ def missing_from_csv(novelties, csv_titles, fuzzy_threshold=90):
             default=0,
         )
         if best < fuzzy_threshold:
-            missing.append({**item, "closest_score": best})
+            missing.append({
+                **item,
+                "closest_score": best,
+                "bgg_url": bgg_search_url(item["title"]),
+            })
     return missing
 
 
@@ -160,12 +170,12 @@ def index():
 
     template = """
     <html><head><title>SPIEL novelties missing from CSV</title><style>
-    body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border-radius:4px;margin:10px 0}.meta{margin:10px 0 20px}
+    body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border-radius:4px;margin:10px 0}.meta{margin:10px 0 20px}a{white-space:nowrap}
     </style></head><body><h1>SPIEL novelties missing from CSV</h1>
     {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
     {% if csv_error %}<div class="warning">CSV data unavailable: {{ csv_error }}</div>{% endif %}
     <div class="meta"><strong>SPIEL novelties:</strong> {{ spiel_count }} | <strong>CSV titles:</strong> {{ csv_count }} | <strong>Missing:</strong> {{ missing_count }}</div>
-    {% if missing %}<table><tr><th>SPIEL title</th><th>ID</th><th>Closest CSV score</th></tr>{% for item in missing %}<tr><td>{{ item.title }}</td><td>{{ item.id or '—' }}</td><td>{{ item.closest_score }}</td></tr>{% endfor %}</table>{% elif not spiel_error and not csv_error %}<p>No unmatched novelties found.</p>{% endif %}
+    {% if missing %}<table><tr><th>SPIEL title</th><th>ID</th><th>Closest CSV score</th><th>BGG</th></tr>{% for item in missing %}<tr><td>{{ item.title }}</td><td>{{ item.id or '—' }}</td><td>{{ item.closest_score }}</td><td><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">Search BGG</a></td></tr>{% endfor %}</table>{% elif not spiel_error and not csv_error %}<p>No unmatched novelties found.</p>{% endif %}
     </body></html>"""
     return render_template_string(
         template,
