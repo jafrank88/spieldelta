@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+USER_AGENT = BROWSER_UA
 SPIEL_PRODUCTS_URL = os.getenv("SPIEL_PRODUCTS_URL", "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D")
 TABLETOP_TOGETHER_URL = os.getenv("TABLETOP_TOGETHER_URL", "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32")
 _cache_lock = threading.Lock()
@@ -41,13 +43,21 @@ def title_key(value):
 
 
 def fetch(url, accept):
+    is_tabletop = "tabletoptogether.com" in url.casefold()
+    headers = {
+        "Accept": accept,
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": BROWSER_UA if is_tabletop else USER_AGENT,
+    }
     try:
-        response = requests.get(url, headers={"Accept": accept, "User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, headers=headers, timeout=(10, 60))
         response.raise_for_status()
+        logger.info("Fetched %s: status=%s bytes=%s", url, response.status_code, len(response.content))
         return response.text, None
     except requests.RequestException as exc:
-        logger.exception("Request failed for %s", url)
-        return None, f"Could not load data from {url}."
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.exception("Request failed for %s (type=%s status=%s)", url, type(exc).__name__, status)
+        return None, f"Could not load data from {url} ({type(exc).__name__}, status={status})."
 
 
 def find_records(value, title_fields=("TITEL", "title", "TITLE", "name", "NAME", "game", "GAME")):
@@ -95,8 +105,6 @@ def add_tabletop_title(results, seen, value):
 def extract_tabletop_titles(page):
     soup = BeautifulSoup(page, "html.parser")
     results, seen = [], set()
-
-    # Conventional tables.
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         headers = [normalize_title(c.get_text(" ", strip=True)).casefold() for c in rows[0].find_all(["th", "td"])] if rows else []
@@ -107,11 +115,8 @@ def extract_tabletop_titles(page):
                 value = cells[title_index].get_text(" ", strip=True) if title_index is not None and title_index < len(cells) else (row.find("a") or cells[0]).get_text(" ", strip=True)
                 add_tabletop_title(results, seen, value)
 
-    # Tabletop Together's share view can render a grid of divs rather than a table.
-    # Each game card contains a Players: detail; take the title immediately before it.
     for detail in soup.find_all(string=re.compile(r"Players\s*:", re.I)):
-        container = detail.parent
-        card = container
+        card = detail.parent
         for _ in range(4):
             if card is None:
                 break
@@ -125,36 +130,26 @@ def extract_tabletop_titles(page):
         if candidates:
             add_tabletop_title(results, seen, candidates[-1].get_text(" ", strip=True))
         else:
-            # For bare text nodes, use the text immediately preceding Players:.
-            text = normalize_title(card.get_text(" ", strip=True))
-            match = re.search(r"(.{2,100})\s+Players\s*:", text, re.I)
+            match = re.search(r"(.{2,100})\s+Players\s*:", normalize_title(card.get_text(" ", strip=True)), re.I)
             if match:
                 add_tabletop_title(results, seen, match.group(1))
 
-    # Embedded structured data and game-related data attributes.
     for script in soup.find_all("script"):
         text = script.string or script.get_text()
         if not text:
             continue
+        values = []
         if script.get("type") in {"application/json", "application/ld+json"}:
             try:
                 values = [json.loads(text)]
             except ValueError:
-                values = []
-        else:
-            values = []
-            for match in re.finditer(r"(\{.*\}|\[.*\])", text, re.DOTALL):
-                try:
-                    values.append(json.loads(match.group(1)))
-                except ValueError:
-                    pass
+                pass
         for value in values:
             for item in find_records(value):
                 add_tabletop_title(results, seen, item.get("title") or item.get("name") or item.get("game") or item.get("TITEL"))
 
     for element in soup.select("a[data-game], a[data-title], [data-game-title], [data-title]"):
         add_tabletop_title(results, seen, element.get("data-game") or element.get("data-title") or element.get("data-game-title") or element.get_text(" ", strip=True))
-
     return results
 
 
