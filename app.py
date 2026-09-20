@@ -21,7 +21,9 @@ REQUEST_TIMEOUT = (10, 60)
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-SPIEL_PRODUCTS_URL = os.getenv("SPIEL_PRODUCTS_URL", "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERNEHMEN%22%2C%22PROGRAMM%22%2C%22HIT%22%2C%22FIRMA%22%2C%22VERLAG%22%2C%22PUBLISHER%22%2C%22MEDIEN%22%2C%22PRESSE%22%2C%22AUSSTELLER%22%2C%22AUSSTELLUNG%22%2C%22MINT%22%2C%22PLATZ%22%2C%22HAUS%22%2C%22SEITEN%22%2C%22ERWARTUNG%22%2C%22WERTUNG%22%2C%22MUSTER_1%22%2C%22MUSTER_2%22%2C%22MUSTER_3%22%2C%22MUSTER_4%22%2C%22MUSTER_5%22%2C%22MUSTER_6%22%2C%22MUSTER_7%22%2C%22SPIELER%22%2C%22ALTER%22%2C%22DAUER%22%2C%22URL%22%5D")
+# Keep this request intentionally minimal. The SPIEL API has returned 500s for
+# otherwise valid requests when unsupported/invalid columns are included.
+SPIEL_PRODUCTS_URL = "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22TITEL%22%5D"
 TABLETOP_TOGETHER_URL = os.getenv("TABLETOP_TOGETHER_URL", "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32")
 TABLETOP_TOGETHER_CSV = os.getenv(
     "TABLETOP_TOGETHER_CSV",
@@ -55,6 +57,12 @@ def fetch(url, accept):
         response.raise_for_status()
         logger.info("Fetched %s: status=%s bytes=%s", url, response.status_code, len(response.content))
         return response.text, None
+    except requests.HTTPError as exc:
+        response = exc.response
+        status = getattr(response, "status_code", None)
+        body = (getattr(response, "text", "") or "")[:500]
+        logger.error("HTTP request failed for %s: status=%s response_body=%r", url, status, body)
+        return None, f"Could not load data from {url} (HTTPError, status={status})."
     except requests.RequestException as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         logger.exception("Request failed for %s (type=%s status=%s)", url, type(exc).__name__, status)
@@ -117,9 +125,6 @@ def extract_tabletop_titles(page):
                 value = cells[title_index].get_text(" ", strip=True) if title_index is not None and title_index < len(cells) else (row.find("a") or cells[0]).get_text(" ", strip=True)
                 add_tabletop_title(results, seen, value)
 
-    # Do not walk up through large parent containers. Find the smallest local
-    # element containing the Players marker and inspect only its direct title
-    # candidates. This prevents repeated multi-megabyte get_text() calls.
     for detail in soup.find_all(string=re.compile(r"Players\s*:", re.I)):
         local = detail.parent
         text = str(detail)[:300]
