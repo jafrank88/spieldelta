@@ -236,7 +236,7 @@ def compare_titles(spiel_titles, tablet_titles):
 @app.route("/")
 def index():
     spiel_titles, spiel_error = get_spiel_novelties()
-    tablet_titles, tablet_error = get_tabletopoptogether_games()
+    tablet_titles, tablet_error = get_tabletoptogether_games()
     matches = compare_titles(spiel_titles, tablet_titles) if spiel_titles and tablet_titles else []
 
     html_template = """
