@@ -18,15 +18,9 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
-USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.6; +https://github.com/jafrank88/spieldelta)"
-SPIEL_PRODUCTS_URL = os.getenv(
-    "SPIEL_PRODUCTS_URL",
-    "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D",
-)
-TABLETOP_TOGETHER_URL = os.getenv(
-    "TABLETOP_TOGETHER_URL",
-    "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32",
-)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+SPIEL_PRODUCTS_URL = os.getenv("SPIEL_PRODUCTS_URL", "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D")
+TABLETOP_TOGETHER_URL = os.getenv("TABLETOP_TOGETHER_URL", "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32")
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
 
@@ -75,19 +69,16 @@ def get_spiel_novelties():
         return [], error
     try:
         data = json.loads(raw)
-    except ValueError as exc:
-        logger.exception("SPIEL response was not JSON: %s", exc)
+    except ValueError:
         return [], "SPIEL product API returned invalid JSON."
-
     games, seen = [], set()
     for item in find_records(data, ("TITEL", "title", "TITLE")):
         item_id = item.get("ID") or item.get("id")
         title = normalize_title(item.get("TITEL") or item.get("title") or item.get("TITLE"))
         key = str(item_id) if item_id is not None else title_key(title)
-        if not title or key in seen:
-            continue
-        seen.add(key)
-        games.append({"id": item_id, "title": title})
+        if title and key not in seen:
+            seen.add(key)
+            games.append({"id": item_id, "title": title})
     logger.info("Fetched %d SPIEL products from %s", len(games), SPIEL_PRODUCTS_URL)
     return (games, None) if games else ([], "SPIEL product API returned no products with titles.")
 
@@ -102,55 +93,65 @@ def add_tabletop_title(results, seen, value):
 
 
 def extract_tabletop_titles(page):
-    """Handle server-rendered tables, embedded JSON, and JS-rendered share pages."""
     soup = BeautifulSoup(page, "html.parser")
     results, seen = [], set()
 
-    # First handle ordinary HTML tables when present.
+    # Conventional tables.
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
-        if not rows:
-            continue
-        headers = [normalize_title(c.get_text(" ", strip=True)).casefold() for c in rows[0].find_all(["th", "td"])]
+        headers = [normalize_title(c.get_text(" ", strip=True)).casefold() for c in rows[0].find_all(["th", "td"])] if rows else []
         title_index = next((i for i, h in enumerate(headers) if any(x in h for x in ("title", "name", "game"))), None)
         for row in rows[1:] if headers else rows:
             cells = row.find_all(["td", "th"])
-            if not cells:
-                continue
-            if title_index is not None and title_index < len(cells):
-                value = cells[title_index].get_text(" ", strip=True)
-            else:
-                link = row.find("a")
-                value = link.get_text(" ", strip=True) if link else cells[0].get_text(" ", strip=True)
-            add_tabletop_title(results, seen, value)
+            if cells:
+                value = cells[title_index].get_text(" ", strip=True) if title_index is not None and title_index < len(cells) else (row.find("a") or cells[0]).get_text(" ", strip=True)
+                add_tabletop_title(results, seen, value)
 
-    # The share page is JavaScript-rendered in some environments. Parse JSON
-    # embedded in script tags and recursively inspect product/game records.
-    json_values = []
+    # Tabletop Together's share view can render a grid of divs rather than a table.
+    # Each game card contains a Players: detail; take the title immediately before it.
+    for detail in soup.find_all(string=re.compile(r"Players\s*:", re.I)):
+        container = detail.parent
+        card = container
+        for _ in range(4):
+            if card is None:
+                break
+            text = normalize_title(card.get_text(" ", strip=True))
+            if "Players:" in text and len(text) <= 500:
+                break
+            card = card.parent
+        if card is None:
+            continue
+        candidates = card.find_all(["b", "strong", "h1", "h2", "h3", "h4", "a"], recursive=True)
+        if candidates:
+            add_tabletop_title(results, seen, candidates[-1].get_text(" ", strip=True))
+        else:
+            # For bare text nodes, use the text immediately preceding Players:.
+            text = normalize_title(card.get_text(" ", strip=True))
+            match = re.search(r"(.{2,100})\s+Players\s*:", text, re.I)
+            if match:
+                add_tabletop_title(results, seen, match.group(1))
+
+    # Embedded structured data and game-related data attributes.
     for script in soup.find_all("script"):
         text = script.string or script.get_text()
-        if not text or not text.strip():
+        if not text:
             continue
-        candidate = text.strip()
         if script.get("type") in {"application/json", "application/ld+json"}:
             try:
-                json_values.append(json.loads(candidate))
+                values = [json.loads(text)]
             except ValueError:
-                pass
+                values = []
         else:
-            for match in re.finditer(r"(?:JSON\.parse\(['\"])?(\{.*\}|\[.*\])(?:['\"]\))?", candidate, re.DOTALL):
+            values = []
+            for match in re.finditer(r"(\{.*\}|\[.*\])", text, re.DOTALL):
                 try:
-                    json_values.append(json.loads(match.group(1)))
+                    values.append(json.loads(match.group(1)))
                 except ValueError:
-                    continue
+                    pass
+        for value in values:
+            for item in find_records(value):
+                add_tabletop_title(results, seen, item.get("title") or item.get("name") or item.get("game") or item.get("TITEL"))
 
-    for value in json_values:
-        for item in find_records(value):
-            title = item.get("TITEL") or item.get("title") or item.get("TITLE") or item.get("name") or item.get("NAME") or item.get("game") or item.get("GAME")
-            add_tabletop_title(results, seen, title)
-
-    # Last fallback: links/data attributes that identify a game, but never
-    # scan every div/span because that creates concatenated page text.
     for element in soup.select("a[data-game], a[data-title], [data-game-title], [data-title]"):
         add_tabletop_title(results, seen, element.get("data-game") or element.get("data-title") or element.get("data-game-title") or element.get_text(" ", strip=True))
 
@@ -162,18 +163,14 @@ def get_tabletop_together_games():
     if error:
         return [], error
     games = extract_tabletop_titles(page)
-    if games:
-        logger.info("Fetched %d Tabletop Together games from %s", len(games), TABLETOP_TOGETHER_URL)
-        return games, None
-    logger.warning("Tabletop Together response contained no recognizable game records; length=%d", len(page))
-    return [], "Tabletop Together share page contained no recognizable game records."
+    logger.info("Fetched %d Tabletop Together games from %s", len(games), TABLETOP_TOGETHER_URL)
+    return (games, None) if games else ([], "Tabletop Together share page contained no recognizable game records.")
 
 
 def cached_data(name, loader):
-    now = time.monotonic()
     with _cache_lock:
         timestamp, data, error = _cache[name]
-        if now - timestamp < CACHE_TTL:
+        if time.monotonic() - timestamp < CACHE_TTL:
             return data, error
         data, error = loader()
         _cache[name] = (time.monotonic(), data, error)
@@ -186,18 +183,15 @@ def compare_titles(spiel_titles, tabletop_titles):
     for spiel in spiel_titles:
         original = normalize_title(spiel["title"])
         key = title_key(original)
-        match, score = exact.get(key), 100 if exact.get(key) else 0
+        match, score = exact.get(key), 100 if key in exact else 0
         if not match:
             for item in tabletop_titles:
-                candidate = normalize_title(item["title"])
-                candidate_key = title_key(candidate)
+                candidate_key = title_key(item["title"])
                 candidate_score = max(fuzz.token_set_ratio(key, candidate_key), fuzz.token_sort_ratio(key, candidate_key), fuzz.ratio(key, candidate_key))
                 if candidate_score > score:
-                    match, score = candidate, candidate_score
+                    match, score = item["title"], candidate_score
         status = "match" if match and score >= 90 else "possible match" if match and score >= 75 else "not found"
-        if status == "not found":
-            match = None
-        results.append({"spiel_title": original, "best_match": match, "status": status, "confidence": score})
+        results.append({"spiel_title": original, "best_match": match if status != "not found" else None, "status": status, "confidence": score})
     return results
 
 
@@ -214,14 +208,9 @@ def index():
     tabletop, tabletop_error = cached_data("tabletop", get_tabletop_together_games)
     matches = compare_titles(spiel, tabletop) if spiel and tabletop else []
     template = """
-    <html><head><title>SPIEL Essen vs Tabletop Together</title><style>
-    body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}
-    </style></head><body><h1>SPIEL Essen vs Tabletop Together</h1>
-    {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
-    {% if tabletop_error %}<div class="warning">Tabletop Together data unavailable: {{ tabletop_error }}</div>{% endif %}
-    <p>SPIEL products: {{ spiel_count }} | Tabletop Together games: {{ tabletop_count }}</p>
-    {% if matches %}<table><tr><th>SPIEL title</th><th>Tabletop Together match</th><th>Status</th><th>Confidence</th></tr>{% for item in matches %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td></tr>{% endfor %}</table>{% endif %}
-    </body></html>"""
+    <html><head><title>SPIEL Essen vs Tabletop Together</title><style>body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}</style></head><body>
+    <h1>SPIEL Essen vs Tabletop Together</h1>{% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}{% if tabletop_error %}<div class="warning">Tabletop Together data unavailable: {{ tabletop_error }}</div>{% endif %}<p>SPIEL products: {{ spiel_count }} | Tabletop Together games: {{ tabletop_count }}</p>
+    {% if matches %}<table><tr><th>SPIEL title</th><th>Tabletop Together match</th><th>Status</th><th>Confidence</th></tr>{% for item in matches %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td></tr>{% endfor %}</table>{% endif %}</body></html>"""
     return render_template_string(template, matches=matches, spiel_count=len(spiel), tabletop_count=len(tabletop), spiel_error=spiel_error, tabletop_error=tabletop_error)
 
 
