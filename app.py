@@ -1,6 +1,7 @@
 import html
 import logging
 import re
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from flask import Flask, render_template_string
@@ -14,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20
 USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.1; +https://github.com/jafrank88/spieldelta)"
-TABLETOP_TOGETHER_URL = "https://tabletoptogether.com/tool/games.php"
 SPIEL_NOVELTIES_URL = "https://spiel-essen.de/en/the-spiel/novelties"
+TABLETOP_TOGETHER_URL = "https://tabletoptogether.com/tool/games.php"
 
 STOP_WORDS = {
     "home",
@@ -40,6 +41,14 @@ STOP_WORDS = {
     "novelties",
     "spiel",
     "the spiel",
+    "newsletter",
+    "subscribe",
+    "hall",
+    "booth",
+    "download",
+    "details",
+    "faq",
+    "support",
 }
 
 
@@ -63,12 +72,36 @@ def fetch_html(url):
         return None, f"Could not load page from {url}."
 
 
-def extract_candidate_titles(html_text):
+def iter_candidate_pages(url):
+    pages = []
+    base_html, base_error = fetch_html(url)
+    if base_error:
+        return pages, base_error
+
+    pages.append((url, base_html))
+    soup = BeautifulSoup(base_html, "html.parser")
+
+    seen = {url}
+    for frame in soup.find_all("iframe", src=True):
+        frame_url = urljoin(url, frame["src"])
+        if frame_url in seen:
+            continue
+        seen.add(frame_url)
+        frame_html, frame_error = fetch_html(frame_url)
+        if frame_error:
+            logger.warning("Could not load iframe %s: %s", frame_url, frame_error)
+            continue
+        pages.append((frame_url, frame_html))
+
+    return pages, None
+
+
+def extract_title_candidates(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
     seen = set()
     results = []
 
-    for tag in soup.find_all(["a", "li", "td", "div", "h1", "h2", "h3", "span", "p"]):
+    for tag in soup.find_all(["a", "li", "td", "div", "h1", "h2", "h3", "span", "p", "article"]):
         text = normalize_title(tag.get_text(" ", strip=True))
         if not text or len(text) < 3:
             continue
@@ -77,7 +110,7 @@ def extract_candidate_titles(html_text):
             continue
         if lowered.startswith("read more") or lowered.startswith("show more"):
             continue
-        if any(token in lowered for token in ["login", "signup", "privacy", "terms", "cart", "search", "news", "newsletter"]):
+        if any(token in lowered for token in ["login", "signup", "privacy", "terms", "cart", "search", "newsletter", "subscribe", "hall", "booth", "support", "contact"]):
             continue
         if text in seen:
             continue
@@ -87,34 +120,38 @@ def extract_candidate_titles(html_text):
     return results
 
 
-def get_tabletoptogether_games():
-    html_text, error = fetch_html(TABLETOP_TOGETHER_URL)
+def gather_titles_from_pages(url):
+    pages, error = iter_candidate_pages(url)
     if error:
         return [], error
 
-    raw_candidates = extract_candidate_titles(html_text)
-    cleaned = []
-    for title in raw_candidates:
-        if len(title) < 3:
+    candidates = []
+    for _, html_text in pages:
+        for title in extract_title_candidates(html_text):
+            if len(title) < 3:
+                continue
+            candidates.append(title)
+
+    unique = []
+    seen = set()
+    for title in candidates:
+        if title in seen:
             continue
-        cleaned.append({"title": title})
+        seen.add(title)
+        unique.append(title)
 
-    if cleaned:
-        return cleaned, None
-
-    return [], "TabletTopTogether games page could not be parsed."
+    return unique, None
 
 
 def get_spiel_novelties():
-    html_text, error = fetch_html(SPIEL_NOVELTIES_URL)
+    titles, error = gather_titles_from_pages(SPIEL_NOVELTIES_URL)
     if error:
         return [], error
 
-    raw_candidates = extract_candidate_titles(html_text)
     cleaned = []
-    for title in raw_candidates:
+    for title in titles:
         lowered = title.lower()
-        if any(token in lowered for token in ["newsletter", "subscribe", "hall", "booth", "event", "news", "login", "signup"]):
+        if any(token in lowered for token in ["download", "newsletter", "subscribe", "hall", "booth", "event", "support", "contact", "report", "privacy"]):
             continue
         cleaned.append({
             "title": title,
@@ -125,8 +162,24 @@ def get_spiel_novelties():
 
     if cleaned:
         return cleaned, None
-
     return [], "SPIEL novelties page could not be parsed."
+
+
+def get_tabletoptogether_games():
+    titles, error = gather_titles_from_pages(TABLETOP_TOGETHER_URL)
+    if error:
+        return [], error
+
+    cleaned = []
+    for title in titles:
+        lowered = title.lower()
+        if any(token in lowered for token in ["download", "newsletter", "subscribe", "hall", "booth", "support", "contact", "privacy", "terms"]):
+            continue
+        cleaned.append({"title": title})
+
+    if cleaned:
+        return cleaned, None
+    return [], "TabletTopTogether games page could not be parsed."
 
 
 def compare_titles(spiel_titles, tablet_titles):
