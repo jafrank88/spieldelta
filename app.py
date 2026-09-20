@@ -1,44 +1,75 @@
 from flask import Flask, render_template_string
-import pandas as pd
 import requests
-from thefuzz import fuzz
 
 app = Flask(__name__)
 
+REQUEST_TIMEOUT = 20
+
+
 def get_bgg_preview_titles(preview_id=93):
-    """Fetches titles listed in BGG's GeekPreview."""
+    """Fetch titles listed in BGG's GeekPreview.
+
+    Return an empty list when the upstream service is unavailable or returns
+    an unexpected response so the page can still render.
+    """
     url = f"https://boardgamegeek.com/api/geekpreview/items?previewid={preview_id}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
+    headers = {"User-Agent": "spieldelta/1.0"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
         return []
-    data = response.json()
+
+    if not isinstance(data, dict):
+        return []
+
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return []
+
     return [
         {
             "bgg_id": item.get("itemid"),
-            "title": item.get("itemname", "").strip(),
-            "publisher": item.get("publishername", "").strip(),
+            "title": str(item.get("itemname") or "").strip(),
+            "publisher": str(item.get("publishername") or "").strip(),
         }
-        for item in data.get("items", [])
+        for item in items
+        if isinstance(item, dict)
     ]
 
+
 def get_spiel_novelties():
-    """Fetches titles listed on the official SPIEL Essen novelties portal."""
+    """Fetch titles listed on the official SPIEL Essen novelties portal."""
     url = "https://www.spiel-essen.de/en/api/novelties"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
+    headers = {"User-Agent": "spieldelta/1.0"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
         return []
-    data = response.json()
+
+    if not isinstance(data, dict):
+        return []
+
+    items = data.get("data", [])
+    if not isinstance(items, list):
+        return []
+
     return [
         {
-            "title": item.get("title", "").strip(),
-            "publisher": item.get("exhibitor", "").strip(),
-            "hall": item.get("hall", ""),
-            "booth": item.get("booth", ""),
+            "title": str(item.get("title") or "").strip(),
+            "publisher": str(item.get("exhibitor") or "").strip(),
+            "hall": str(item.get("hall") or ""),
+            "booth": str(item.get("booth") or ""),
         }
-        for item in data.get("data", [])
+        for item in items
+        if isinstance(item, dict)
     ]
+
 
 @app.route("/")
 def index():
@@ -76,11 +107,14 @@ def index():
     </body>
     </html>
     """
-    return render_template_string(html_template,
-                                  bgg_titles=bgg_titles,
-                                  spiel_titles=spiel_titles,
-                                  bgg_count=len(bgg_titles),
-                                  spiel_count=len(spiel_titles))
+    return render_template_string(
+        html_template,
+        bgg_titles=bgg_titles,
+        spiel_titles=spiel_titles,
+        bgg_count=len(bgg_titles),
+        spiel_count=len(spiel_titles),
+    )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
