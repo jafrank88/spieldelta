@@ -353,41 +353,60 @@ def get_bgg_things(ids):
         return [(i, _bgg_things[i]) for i in ids if i in _bgg_things]
 
 
-def resolve_bgg_game(game):
+def resolve_bgg_game(game, trace=None):
     """
     Find the BGG game whose name AND publisher both match this SPIEL entry.
-    Returns {"id": int, "name": str} or None. At most two API calls: search, then a batched thing lookup
-    (skipped for candidates already in the thing cache).
+    Returns (match, reason): match is {"id": int, "name": str} or None; reason says why there is no match.
+    At most two API calls: search, then a batched thing lookup (skipped for candidates already in the thing cache).
+    Pass a list as `trace` to collect the raw scores (used by /bgg-why).
     """
     spiel_key = title_key(game["title"])
     if not spiel_key:
-        return None
+        return None, "SPIEL title is empty after normalizing"
 
-    search = bgg_get("search", {"query": game.get("raw_title") or game["title"], "type": "boardgame,boardgameexpansion"})
+    query = game.get("raw_title") or game["title"]
+    search = bgg_get("search", {"query": query, "type": "boardgame,boardgameexpansion"})
     if search is None:
         raise RuntimeError("search failed")  # transient: leave unresolved so it retries later
 
-    candidates = []
+    found = []
     for item in search.findall("item"):
         name_el = item.find("name")
-        if name_el is None:
-            continue
-        score = fuzz.ratio(spiel_key, title_key(name_el.get("value")))
-        if score >= NAME_THRESHOLD:
-            candidates.append((score, item.get("id")))
-    candidates = [cid for _, cid in sorted(candidates, key=lambda t: -t[0])[:8]]
-    if not candidates:
-        return None
+        if name_el is not None:
+            found.append((fuzz.ratio(spiel_key, title_key(name_el.get("value"))), item.get("id"), name_el.get("value")))
+    found.sort(key=lambda t: -t[0])
+    if trace is not None:
+        trace.append({"step": "search", "query": query, "spiel_key": spiel_key,
+                      "results": [{"id": i, "name": n, "name_score": sc} for sc, i, n in found[:15]]})
+    if not found:
+        return None, "BGG search returned no results"
 
-    best = None
+    candidates = [cid for sc, cid, _ in found if sc >= NAME_THRESHOLD][:8]
+    if not candidates:
+        top = found[0]
+        return None, f"no BGG name close enough (closest: '{top[2]}' at {int(top[0])}%, need {NAME_THRESHOLD}%)"
+
+    best, closest_pub = None, None
     for cid, thing in get_bgg_things(candidates):
         name_score = best_name_score(spiel_key, thing["names"])
         pub_score = best_publisher_score(game["publishers"], thing["publishers"])
+        if trace is not None:
+            trace.append({"step": "candidate", "id": cid, "bgg_name": thing["primary"], "name_score": name_score,
+                          "bgg_publishers": thing["publishers"], "spiel_publishers": game["publishers"], "publisher_score": pub_score})
         if name_score >= NAME_THRESHOLD and pub_score >= PUBLISHER_THRESHOLD:
             rank = name_score + pub_score
             if best is None or rank > best[0]:
                 best = (rank, {"id": int(cid), "name": thing["primary"]})
-    return best[1] if best else None
+        elif name_score >= NAME_THRESHOLD and (closest_pub is None or pub_score > closest_pub[0]):
+            closest_pub = (pub_score, cid, thing)
+    if best:
+        return best[1], "matched"
+    if closest_pub:
+        pub_score, cid, thing = closest_pub
+        bgg_pubs = ", ".join(thing["publishers"][:4]) or "none listed yet"
+        return None, (f"BGG has '{thing['primary']}' (id {cid}) but the publisher didn't match "
+                      f"({int(pub_score)}%, need {PUBLISHER_THRESHOLD}%): SPIEL says '{', '.join(game['publishers'])}', BGG lists {bgg_pubs}")
+    return None, "no BGG candidate passed the name check"
 
 
 def load_bgg_cache():
@@ -424,7 +443,7 @@ def _bgg_worker(games):
             if cache_entry_fresh(_bgg_results.get(game["key"]), game):
                 continue
         try:
-            match = resolve_bgg_game(game)
+            match, reason = resolve_bgg_game(game)
         except BGGAuthError as exc:
             _bgg_disabled_reason = str(exc)
             logger.error("Disabling BGG lookups: %s", exc)
@@ -432,7 +451,7 @@ def _bgg_worker(games):
         except Exception:
             logger.exception("BGG lookup failed for %s", game["title"])
             continue  # not cached, so it is retried on the next worker run
-        entry = {"id": match["id"], "name": match["name"]} if match else {"id": None}
+        entry = {"id": match["id"], "name": match["name"]} if match else {"id": None, "reason": reason}
         entry.update(checked=int(time.time()), sig=game_signature(game))
         with _bgg_lock:
             _bgg_results[game["key"]] = entry
@@ -540,10 +559,17 @@ def compare_titles(spiel_titles, tabletop_titles):
     for spiel, (original, status, match, score) in zip(spiel_titles, fuzzy_matches(spiel_titles, tabletop_titles)):
         with _bgg_lock:
             bgg = _bgg_results.get(spiel.get("key"))
+        bgg_reason = ""
         if bgg and bgg.get("id"):
             bgg_url, bgg_kind = bgg_game_url(bgg["id"]), "direct"
         else:
             bgg_url, bgg_kind = bgg_search_url(original), "search"
+            if not BGG_API_TOKEN:
+                bgg_reason = "BGG lookups are off (BGG_API_TOKEN not set)"
+            elif bgg:
+                bgg_reason = bgg.get("reason", "")
+            elif status in BGG_LOOKUP_STATUSES:
+                bgg_reason = "not looked up yet"
 
         results.append({
             "spiel_title": original,
@@ -555,6 +581,7 @@ def compare_titles(spiel_titles, tabletop_titles):
             "confidence": score,
             "bgg_url": bgg_url,
             "bgg_kind": bgg_kind,
+            "bgg_reason": bgg_reason,
         })
     return results
 
@@ -562,6 +589,38 @@ def compare_titles(spiel_titles, tabletop_titles):
 def delta_games(spiel, matches):
     """SPIEL games missing from the Tabletop Together list. compare_titles returns one row per game, in order."""
     return [g for g, m in zip(spiel, matches) if m["status"] in BGG_LOOKUP_STATUSES]
+
+
+@app.route("/bgg-why")
+def bgg_why():
+    """
+    Explains a BGG lookup for one SPIEL title, live and uncached: /bgg-why?title=Deae+Via&key=...
+    Disabled unless BGG_DEBUG_KEY is set (it spends BGG API calls, so it must not be public).
+    """
+    debug_key = os.getenv("BGG_DEBUG_KEY", "")
+    if not debug_key or request.args.get("key") != debug_key:
+        return "Not found", 404
+    if not BGG_API_TOKEN:
+        return jsonify(error="BGG_API_TOKEN is not set on this server, so no BGG lookups can happen."), 400
+    wanted = title_key(request.args.get("title", ""))
+    spiel, error = cached_data("spiel", get_spiel_novelties)
+    if error or not wanted:
+        return jsonify(error=error or "pass ?title=..."), 400
+    game = next((g for g in spiel if title_key(g["title"]) == wanted), None) or next((g for g in spiel if wanted in title_key(g["title"])), None)
+    if not game:
+        return jsonify(error=f"No SPIEL novelty with a title like '{request.args.get('title')}'"), 404
+    trace = []
+    try:
+        match, reason = resolve_bgg_game(game, trace)
+    except BGGAuthError as exc:
+        return jsonify(error=str(exc)), 502
+    except Exception as exc:
+        return jsonify(error=f"BGG lookup failed: {exc}"), 502
+    with _bgg_lock:
+        cached = _bgg_results.get(game["key"])
+    return jsonify(spiel_game={k: game[k] for k in ("id", "title", "raw_title", "publishers", "hall", "booth")},
+                   thresholds={"name": NAME_THRESHOLD, "publisher": PUBLISHER_THRESHOLD},
+                   result=match, reason=reason, cached_entry=cached, trace=trace)
 
 
 @app.route("/health", methods=["GET", "HEAD"])
@@ -594,7 +653,7 @@ def index():
 <html><head><title>SPIEL novelties not on the Tabletop Together list</title>
 {% if bgg_pending %}<meta http-equiv="refresh" content="60">{% endif %}
 <style>
-body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}.bgg-search{color:#888}
+body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}.bgg-search{color:#888}.bgg-reason{color:#888;font-size:11px}th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th[data-dir=asc]::after{content:" \\25B2"}th[data-dir=desc]::after{content:" \\25BC"}
 </style></head><body><h1>SPIEL novelties not on the Tabletop Together list</h1>
 {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
 {% if tabletop_error %}<div class="warning">Preview list (CSV) unavailable: {{ tabletop_error }}</div>{% endif %}
@@ -603,7 +662,43 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
 {% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
 {% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
-{% if rows %}<table><tr><th>SPIEL title</th><th>Publisher</th><th>Hall</th><th>Booth</th><th>Tabletop Together match</th><th>Status</th><th>Confidence</th><th>BGG</th></tr>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td><td>{% if item.bgg_kind == "direct" %}<a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a>{% else %}<a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% endif %}</td></tr>{% endfor %}</table>{% endif %}
+{% if rows %}<p><small>Click a column heading to sort.</small></p>
+<table id="results"><thead><tr><th class="sortable">SPIEL title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">Tabletop Together match</th><th class="sortable">Status</th><th class="sortable">Confidence</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td>{% if item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a></td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
+<script>
+(function () {
+  var table = document.getElementById("results");
+  if (!table) return;
+  var tbody = table.tBodies[0];
+  var heads = table.tHead.rows[0].cells;
+  var collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
+  function cellValue(row, col) {
+    var cell = row.cells[col];
+    var v = cell.getAttribute("data-sort");
+    return (v !== null ? v : cell.textContent).trim();
+  }
+  function sortBy(col, dir) {
+    var rows = Array.prototype.slice.call(tbody.rows);
+    rows.sort(function (a, b) {
+      var x = cellValue(a, col), y = cellValue(b, col);
+      var ex = (x === "" || x === "-"), ey = (y === "" || y === "-");
+      if (ex !== ey) return ex ? 1 : -1;  // empty cells always last
+      return dir * collator.compare(x, y);
+    });
+    rows.forEach(function (r) { tbody.appendChild(r); });
+    for (var i = 0; i < heads.length; i++) heads[i].setAttribute("data-dir", i === col ? (dir > 0 ? "asc" : "desc") : "");
+    try { sessionStorage.setItem("spieldelta-sort", JSON.stringify({col: col, dir: dir})); } catch (e) {}
+  }
+  Array.prototype.forEach.call(heads, function (th, i) {
+    th.addEventListener("click", function () {
+      sortBy(i, th.getAttribute("data-dir") === "asc" ? -1 : 1);
+    });
+  });
+  try {  // keep the chosen sort across the automatic refresh while BGG lookups are running
+    var saved = JSON.parse(sessionStorage.getItem("spieldelta-sort") || "null");
+    if (saved && saved.col < heads.length) sortBy(saved.col, saved.dir);
+  } catch (e) {}
+})();
+</script>{% endif %}
 </body></html>"""
     return render_template_string(
         template, matches=matches, rows=rows, show_all=show_all, spiel_count=len(spiel), tabletop_count=len(tabletop),
