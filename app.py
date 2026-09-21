@@ -23,7 +23,7 @@ ERROR_TTL = 30  # seconds; failures are retried sooner than successes
 FUZZY_THRESHOLD = int(os.getenv("FUZZY_THRESHOLD", "90"))
 
 # Tabletop Together CSV export, committed next to app.py (or set the env vars).
-CSV_PATH = os.getenv("TABLETOP_CSV_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tabletop.csv"))
+CSV_PATH = os.getenv("TABLETOP_CSV_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "TabletopTogetherTool.csv"))
 CSV_COLUMN = os.getenv("TABLETOP_CSV_COLUMN", "")  # leave empty to auto-detect
 
 USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.7; +https://github.com/jafrank88/spieldelta)"
@@ -31,7 +31,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.7; +https://github.com/jafra
 # Known-good column list (the same request the SPIEL novelties page makes).
 SPIEL_PRODUCTS_URL = os.getenv(
     "SPIEL_PRODUCTS_URL",
-    "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D",
+    "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%5D",
 )
 
 # The novelties list is rendered client-side and has no per-item URL or
@@ -139,7 +139,7 @@ def _read_csv(path):
 
 def get_csv_titles():
     if not os.path.exists(CSV_PATH):
-        return [], f"CSV file not found: {os.path.basename(CSV_PATH)}. Commit your Tabletop Together export as tabletop.csv."
+        return [], f"CSV file not found: {os.path.basename(CSV_PATH)}. Commit your Tabletop Together export as TabletopTogetherTool.csv."
     try:
         text = _read_csv(CSV_PATH)
         try:
