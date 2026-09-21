@@ -53,11 +53,15 @@ BGG_THING_TTL = float(os.getenv("BGG_THING_TTL_DAYS", "7")) * 86400
 # Only SPIEL games NOT already on the Tabletop Together / BGG Spiel Preview list get a BGG API lookup.
 # "possible match" (fuzzy 75-89) is ambiguous, so it is looked up too; set to "not found" to be stricter.
 BGG_LOOKUP_STATUSES = {x.strip() for x in os.getenv("BGG_LOOKUP_STATUSES", "not found,possible match").split(",") if x.strip()}
-NAME_THRESHOLD = 90
-PUBLISHER_THRESHOLD = 85
+# Fuzzy-match thresholds (0-100). Configurable via env so tuning doesn't require a redeploy.
+NAME_THRESHOLD = int(os.getenv("BGG_NAME_THRESHOLD", "90"))
+PUBLISHER_THRESHOLD = int(os.getenv("BGG_PUBLISHER_THRESHOLD", "85"))
 
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
+# One lock per cache key so a slow fetch for "spiel" doesn't block a concurrent request for "tabletop",
+# and so two concurrent requests for the same stale key don't both trigger the (slow) loader.
+_cache_refresh_locks = {"spiel": threading.Lock(), "tabletop": threading.Lock()}
 
 _bgg_lock = threading.Lock()
 _bgg_results = {}  # spiel game key -> {"id": int|None, "name": str|None, "checked": epoch, "sig": str}
@@ -65,7 +69,7 @@ _bgg_things = {}   # BGG id -> {"names": [...], "primary": str, "publishers": [.
 _bgg_cache_loaded = False
 _bgg_thread = None
 _bgg_disabled_reason = None
-_bgg_last_call = 0.0
+_bgg_last_call = 0.0  # guarded by _bgg_lock (see bgg_get)
 
 GENERIC_PUBLISHER_WORDS = {
     "games", "game", "spiele", "spiel", "verlag", "gmbh", "co", "kg", "ltd", "llc", "inc", "sl", "srl",
@@ -165,7 +169,14 @@ def get_spiel_novelties():
     for item in find_records(data, ("TITEL", "title", "TITLE")):
         item_id = item.get("ID") or item.get("id")
         title = normalize_title(item.get("TITEL") or item.get("title") or item.get("TITLE"))
-        key = str(item_id) if item_id is not None else title_key(title)
+        publishers = extract_publishers(item)
+        if item_id is not None:
+            key = str(item_id)
+        else:
+            # No ID to disambiguate: fold in the publisher too, so two different games that happen to
+            # share a normalized title (but have different publishers) don't collide into one entry.
+            pub_sig = "|".join(sorted(publisher_key(p) for p in publishers))
+            key = f"{title_key(title)}::{pub_sig}"
         if not title or key in seen:
             continue
         seen.add(key)
@@ -175,7 +186,7 @@ def get_spiel_novelties():
             "key": key,
             "title": title,
             "raw_title": html.unescape(str(item.get("TITEL") or item.get("title") or item.get("TITLE"))).strip(),
-            "publishers": extract_publishers(item),
+            "publishers": publishers,
             "hall": ", ".join(halls),
             "booth": ", ".join(booths),
         })
@@ -244,13 +255,28 @@ def get_preview_games():
 
 
 def cached_data(name, loader):
+    """
+    Returns (data, error) for `name`, refreshing via `loader()` if the cache is stale.
+    The network call happens OUTSIDE _cache_lock (only the dict read/write is protected), and a
+    per-key lock prevents two concurrent requests for the same stale key from both hitting the network.
+    """
     now = time.monotonic()
     with _cache_lock:
         timestamp, data, error = _cache[name]
         if now - timestamp < CACHE_TTL:
             return data, error
+
+    with _cache_refresh_locks[name]:
+        # Re-check: another thread may have refreshed this key while we were waiting for the lock.
+        now = time.monotonic()
+        with _cache_lock:
+            timestamp, data, error = _cache[name]
+            if now - timestamp < CACHE_TTL:
+                return data, error
+
         data, error = loader()
-        _cache[name] = (time.monotonic(), data, error)
+        with _cache_lock:
+            _cache[name] = (time.monotonic(), data, error)
         return data, error
 
 
@@ -274,10 +300,12 @@ def bgg_get(endpoint, params, attempts=4):
     global _bgg_last_call
     headers = {"Authorization": f"Bearer {BGG_API_TOKEN}", "User-Agent": USER_AGENT}
     for attempt in range(1, attempts + 1):
-        wait = BGG_MIN_INTERVAL - (time.monotonic() - _bgg_last_call)
+        with _bgg_lock:
+            wait = BGG_MIN_INTERVAL - (time.monotonic() - _bgg_last_call)
         if wait > 0:
             time.sleep(wait)
-        _bgg_last_call = time.monotonic()
+        with _bgg_lock:
+            _bgg_last_call = time.monotonic()
         try:
             response = requests.get(f"{BGG_API_BASE}/{endpoint}", params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         except requests.RequestException:
@@ -506,7 +534,18 @@ def build_bgg_cache():
 # --- Comparison ---------------------------------------------------------------
 
 _match_lock = threading.Lock()
-_match_cache = {"spiel": None, "tabletop": None, "rows": None}
+_match_cache = {"sig": None, "rows": None}
+
+
+def _match_cache_signature(spiel_titles, tabletop_titles):
+    """
+    A cheap content-based signature (not object identity) so the memoized fuzzy-match result is reused
+    correctly even if a cache reload returns a new-but-equal list, and correctly invalidated when the
+    underlying titles actually change.
+    """
+    spiel_sig = tuple((g.get("key"), g["title"]) for g in spiel_titles)
+    tabletop_sig = tuple(t["title"] for t in tabletop_titles)
+    return hash((spiel_sig, tabletop_sig))
 
 
 def fuzzy_matches(spiel_titles, tabletop_titles):
@@ -515,11 +554,12 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
 
     This is the expensive part (every non-exact title is scored against the whole preview list), so:
     the preview titles are normalized once, rapidfuzz's C++ extractOne does the scanning, and the result
-    is cached until the underlying data lists are reloaded.
+    is cached until the underlying data (by content, not just object identity) changes.
     """
+    sig = _match_cache_signature(spiel_titles, tabletop_titles)
     with _match_lock:
         c = _match_cache
-        if c["spiel"] is spiel_titles and c["tabletop"] is tabletop_titles:
+        if c["sig"] == sig:
             return c["rows"]
         started = time.monotonic()
         keys = [title_key(item["title"]) for item in tabletop_titles]
@@ -549,7 +589,7 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
             status = "match" if match and score >= 90 else "possible match" if match and score >= 75 else "not found"
             rows.append((original, status, match if status != "not found" else None, score))
 
-        c["spiel"], c["tabletop"], c["rows"] = spiel_titles, tabletop_titles, rows
+        c["sig"], c["rows"] = sig, rows
         logger.info("Matched %d SPIEL titles against %d preview titles in %.1fs", len(spiel_titles), len(tabletop_titles), time.monotonic() - started)
         return rows
 
@@ -662,8 +702,8 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
 {% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
 {% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
-{% if rows %}<p><small>Click a column heading to sort.</small></p>
-<table id="results"><thead><tr><th class="sortable">SPIEL title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">Tabletop Together match</th><th class="sortable">Status</th><th class="sortable">Confidence</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td>{% if item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a></td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
+{% if rows %}<p><small>Click a column heading to sort (title, publisher, hall, booth, match, status, confidence, or BGG). Click again to reverse.</small></p>
+<table id="results"><thead><tr><th class="sortable">SPIEL title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">Tabletop Together match</th><th class="sortable">Status</th><th class="sortable">Confidence</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td data-sort="{{ item.confidence }}">{{ item.confidence }}%</td>{% if item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a></td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
 <script>
 (function () {
   var table = document.getElementById("results");
@@ -676,12 +716,19 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
     var v = cell.getAttribute("data-sort");
     return (v !== null ? v : cell.textContent).trim();
   }
+  function isNumericCol(col) {
+    // Confidence column: compare as numbers so 100 sorts after 90, not lexicographically.
+    var v = tbody.rows.length ? tbody.rows[0].cells[col].getAttribute("data-sort") : null;
+    return col === 6 && v !== null;
+  }
   function sortBy(col, dir) {
     var rows = Array.prototype.slice.call(tbody.rows);
+    var numeric = isNumericCol(col);
     rows.sort(function (a, b) {
       var x = cellValue(a, col), y = cellValue(b, col);
       var ex = (x === "" || x === "-"), ey = (y === "" || y === "-");
       if (ex !== ey) return ex ? 1 : -1;  // empty cells always last
+      if (numeric) return dir * ((parseFloat(x) || 0) - (parseFloat(y) || 0));
       return dir * collator.compare(x, y);
     });
     rows.forEach(function (r) { tbody.appendChild(r); });
