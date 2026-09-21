@@ -15,6 +15,7 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, render_template_string, request
+from rapidfuzz import fuzz as rfuzz, process as rprocess
 from thefuzz import fuzz
 
 app = Flask(__name__)
@@ -485,24 +486,58 @@ def build_bgg_cache():
 
 # --- Comparison ---------------------------------------------------------------
 
-def compare_titles(spiel_titles, tabletop_titles):
-    exact = {title_key(item["title"]): item["title"] for item in tabletop_titles}
-    results = []
-    for spiel in spiel_titles:
-        original = normalize_title(spiel["title"])
-        key = title_key(original)
-        match, score = exact.get(key), 100 if exact.get(key) else 0
-        if not match:
-            for item in tabletop_titles:
-                candidate = normalize_title(item["title"])
-                candidate_key = title_key(candidate)
-                candidate_score = max(fuzz.token_set_ratio(key, candidate_key), fuzz.token_sort_ratio(key, candidate_key), fuzz.ratio(key, candidate_key))
-                if candidate_score > score:
-                    match, score = candidate, candidate_score
-        status = "match" if match and score >= 90 else "possible match" if match and score >= 75 else "not found"
-        if status == "not found":
-            match = None
+_match_lock = threading.Lock()
+_match_cache = {"spiel": None, "tabletop": None, "rows": None}
 
+
+def fuzzy_matches(spiel_titles, tabletop_titles):
+    """
+    One (spiel_title, status, best_match, score) per SPIEL game, in order.
+
+    This is the expensive part (every non-exact title is scored against the whole preview list), so:
+    the preview titles are normalized once, rapidfuzz's C++ extractOne does the scanning, and the result
+    is cached until the underlying data lists are reloaded.
+    """
+    with _match_lock:
+        c = _match_cache
+        if c["spiel"] is spiel_titles and c["tabletop"] is tabletop_titles:
+            return c["rows"]
+        started = time.monotonic()
+        keys = [title_key(item["title"]) for item in tabletop_titles]
+        display = [normalize_title(item["title"]) for item in tabletop_titles]
+        exact = {}
+        for k, d in zip(keys, display):
+            exact.setdefault(k, d)
+        scorers = (rfuzz.token_set_ratio, rfuzz.token_sort_ratio, rfuzz.ratio)
+
+        rows = []
+        for spiel in spiel_titles:
+            original = normalize_title(spiel["title"])
+            key = title_key(original)
+            if key in exact:
+                match, score = exact[key], 100
+            else:
+                match, score = None, 0
+                if key and keys:
+                    best_index, best_score = None, 0.0
+                    for scorer in scorers:
+                        # score_cutoff prunes later scorers to candidates that can still beat the best so far
+                        hit = rprocess.extractOne(key, keys, scorer=scorer, score_cutoff=best_score)
+                        if hit and (best_index is None or hit[1] > best_score):
+                            best_index, best_score = hit[2], hit[1]
+                    if best_index is not None:
+                        match, score = display[best_index], int(round(best_score))
+            status = "match" if match and score >= 90 else "possible match" if match and score >= 75 else "not found"
+            rows.append((original, status, match if status != "not found" else None, score))
+
+        c["spiel"], c["tabletop"], c["rows"] = spiel_titles, tabletop_titles, rows
+        logger.info("Matched %d SPIEL titles against %d preview titles in %.1fs", len(spiel_titles), len(tabletop_titles), time.monotonic() - started)
+        return rows
+
+
+def compare_titles(spiel_titles, tabletop_titles):
+    results = []
+    for spiel, (original, status, match, score) in zip(spiel_titles, fuzzy_matches(spiel_titles, tabletop_titles)):
         with _bgg_lock:
             bgg = _bgg_results.get(spiel.get("key"))
         if bgg and bgg.get("id"):
@@ -546,6 +581,9 @@ def index():
     # If either source failed, matches is empty and NO BGG calls are made (never fall back to looking up everything).
     delta = delta_games(spiel, matches) if matches else []
     ensure_bgg_worker(delta)
+    # Only novelties that are NOT already on the CSV are listed. Add ?all=1 to the URL to see every row (for debugging).
+    show_all = request.args.get("all") == "1"
+    rows = matches if show_all else [m for m in matches if m["status"] in BGG_LOOKUP_STATUSES]
 
     with _bgg_lock:
         bgg_resolved = sum(1 for g in delta if cache_entry_fresh(_bgg_results.get(g["key"]), g))
@@ -553,21 +591,22 @@ def index():
     bgg_pending = bool(BGG_API_TOKEN) and not _bgg_disabled_reason and bgg_resolved < len(delta)
 
     template = """
-<html><head><title>SPIEL Essen vs Tabletop Together</title>
+<html><head><title>SPIEL novelties not on the Tabletop Together list</title>
 {% if bgg_pending %}<meta http-equiv="refresh" content="60">{% endif %}
 <style>
 body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}.bgg-search{color:#888}
-</style></head><body><h1>SPIEL Essen vs Tabletop Together</h1>
+</style></head><body><h1>SPIEL novelties not on the Tabletop Together list</h1>
 {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
 {% if tabletop_error %}<div class="warning">Preview list (CSV) unavailable: {{ tabletop_error }}</div>{% endif %}
 {% if bgg_disabled_reason %}<div class="warning">BGG direct links disabled: {{ bgg_disabled_reason }}. Showing search links.</div>{% endif %}
-<p>SPIEL products: {{ spiel_count }} | Tabletop Together games: {{ tabletop_count }}
-{% if bgg_token %} | BGG lookups for games not on the Tabletop Together list: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
+<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together CSV titles: {{ tabletop_count }}{% if matches %} | Not on the CSV (shown below): {{ delta_count }}{% endif %}{% if show_all %} | <b>showing all rows</b>{% endif %}
+{% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
-{% if matches %}<table><tr><th>SPIEL title</th><th>Publisher</th><th>Hall</th><th>Booth</th><th>Tabletop Together match</th><th>Status</th><th>Confidence</th><th>BGG</th></tr>{% for item in matches %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td><td>{% if item.bgg_kind == "direct" %}<a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a>{% else %}<a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% endif %}</td></tr>{% endfor %}</table>{% endif %}
+{% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
+{% if rows %}<table><tr><th>SPIEL title</th><th>Publisher</th><th>Hall</th><th>Booth</th><th>Tabletop Together match</th><th>Status</th><th>Confidence</th><th>BGG</th></tr>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td>{{ item.confidence }}%</td><td>{% if item.bgg_kind == "direct" %}<a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a>{% else %}<a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% endif %}</td></tr>{% endfor %}</table>{% endif %}
 </body></html>"""
     return render_template_string(
-        template, matches=matches, spiel_count=len(spiel), tabletop_count=len(tabletop),
+        template, matches=matches, rows=rows, show_all=show_all, spiel_count=len(spiel), tabletop_count=len(tabletop),
         spiel_error=spiel_error, tabletop_error=tabletop_error,
         bgg_token=bool(BGG_API_TOKEN), delta_count=len(delta), bgg_pending=bgg_pending, bgg_resolved=bgg_resolved,
         bgg_direct=bgg_direct, bgg_disabled_reason=_bgg_disabled_reason,
