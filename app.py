@@ -53,7 +53,7 @@ BGG_THING_TTL = float(os.getenv("BGG_THING_TTL_DAYS", "7")) * 86400
 # Only SPIEL games NOT already on the Tabletop Together / BGG Spiel Preview list get a BGG API lookup.
 # "possible match" (fuzzy 75-89) is ambiguous, so it is looked up too; set to "not found" to be stricter.
 BGG_LOOKUP_STATUSES = {x.strip() for x in os.getenv("BGG_LOOKUP_STATUSES", "not found,possible match").split(",") if x.strip()}
-# Fuzzy-match thresholds (0-100). Configurable via env so tuning doesn't require a redeploy.
+# BGG thresholds (0-100). CSV matching also uses PUBLISHER_THRESHOLD as a hard fuzzy-match gate.
 NAME_THRESHOLD = int(os.getenv("BGG_NAME_THRESHOLD", "90"))
 PUBLISHER_THRESHOLD = int(os.getenv("BGG_PUBLISHER_THRESHOLD", "85"))
 # Fallback for new/small-press games whose BGG publisher field is empty or mismatched:
@@ -211,13 +211,18 @@ def get_spiel_novelties():
 
 # --- Tabletop Together -------------------------------------------------------
 
-def add_tabletop_title(results, seen, value):
+def add_tabletop_title(results_by_key, value, publishers=""):
+    """Add/merge a Tabletop Together title and retain its publisher metadata."""
     value = normalize_title(value)
     key = title_key(value)
-    if not key or len(value) > 180 or key in seen or key in {"title", "name", "game", "games", "sort", "filter", "search"}:
+    if not key or len(value) > 180 or key in {"title", "name", "game", "games", "sort", "filter", "search"}:
         return
-    seen.add(key)
-    results.append({"title": value})
+    entry = results_by_key.setdefault(key, {"title": value, "publishers": []})
+    raw_publishers = re.split(r"[,;]|•|\\s+/\\s+", str(publishers or ""))
+    for publisher in raw_publishers:
+        publisher = normalize_title(publisher)
+        if publisher and publisher.casefold() not in {p.casefold() for p in entry["publishers"]}:
+            entry["publishers"].append(publisher)
 
 
 def find_preview_csv():
@@ -243,13 +248,21 @@ def pick_title_column(header):
 
 
 def get_preview_games():
-    """Titles already on the BGG Spiel Preview list, read from the CSV in the repo."""
+    """Titles already on the BGG Spiel Preview list, including publisher metadata from the CSV."""
     path, error = find_preview_csv()
     if error:
         return [], error
     try:
         with open(path, encoding="utf-8-sig", newline="") as fh:
             text = fh.read()
+    except UnicodeDecodeError:
+        # Some exported CSVs contain legacy bytes even though the rest is UTF-8.
+        try:
+            with open(path, encoding="latin1", newline="") as fh:
+                text = fh.read()
+        except OSError as exc:
+            logger.warning("Could not read %s", path)
+            return [], f"Could not read preview CSV {path}: {exc.strerror or exc}"
     except OSError as exc:
         logger.warning("Could not read %s", path)
         return [], f"Could not read preview CSV {path}: {exc.strerror or exc}"
@@ -260,12 +273,20 @@ def get_preview_games():
     rows = [r for r in csv.reader(io.StringIO(text), dialect) if any(c.strip() for c in r)]
     if len(rows) < 2:
         return [], f"Preview CSV {os.path.basename(path)} has no data rows."
+    header = [normalize_title(h).casefold() for h in rows[0]]
     index_ = pick_title_column(rows[0])
-    results, seen = [], set()
+    publisher_index = next((i for i, h in enumerate(header) if "publisher" in h), None)
+    results_by_key = {}
     for row in rows[1:]:
         if index_ < len(row):
-            add_tabletop_title(results, seen, row[index_])
-    logger.info("Loaded %d preview games from %s (title column: %r)", len(results), path, rows[0][index_])
+            publisher = row[publisher_index] if publisher_index is not None and publisher_index < len(row) else ""
+            add_tabletop_title(results_by_key, row[index_], publisher)
+    results = list(results_by_key.values())
+    logger.info(
+        "Loaded %d unique preview titles from %s (title column: %r, publisher column: %r)",
+        len(results), path, rows[0][index_],
+        rows[0][publisher_index] if publisher_index is not None else None,
+    )
     return (results, None) if results else ([], f"No titles found in {os.path.basename(path)}.")
 
 
@@ -554,7 +575,7 @@ def load_bgg_cache():
 def save_bgg_cache():
     try:
         with _bgg_lock:
-            snapshot = {"version": 2, "games": dict(_bgg_results), "things": dict(_bgg_things)}
+            snapshot = {"version": 3, "games": dict(_bgg_results), "things": dict(_bgg_things)}
         tmp = f"{BGG_CACHE_FILE}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(snapshot, fh, separators=(",", ":"))
@@ -643,55 +664,133 @@ _match_cache = {"sig": None, "rows": None}
 
 
 def _match_cache_signature(spiel_titles, tabletop_titles):
-    """Content-based signature (not object identity) so memoization survives a reloaded-but-equal list."""
-    spiel_sig = tuple((g.get("key"), g["title"]) for g in spiel_titles)
-    tabletop_sig = tuple(t["title"] for t in tabletop_titles)
+    """Content-based signature including publisher data, so publisher changes invalidate matches."""
+    spiel_sig = tuple(
+        (g.get("key"), g["title"], tuple(sorted(publisher_key(p) for p in g.get("publishers", []))))
+        for g in spiel_titles
+    )
+    tabletop_sig = tuple(
+        (t["title"], tuple(sorted(publisher_key(p) for p in t.get("publishers", []))))
+        for t in tabletop_titles
+    )
     return hash((spiel_sig, tabletop_sig))
+
+
+def _publisher_match_score(spiel_publishers, tabletop_publishers):
+    """Return the best publisher similarity, or 0 when either side has no publisher."""
+    if not spiel_publishers or not tabletop_publishers:
+        return 0
+    return best_publisher_score(spiel_publishers, tabletop_publishers)
+
+
+def _publisher_compatible(spiel_publishers, tabletop_publishers):
+    """Require strong publisher evidence before accepting a fuzzy title match."""
+    if not spiel_publishers or not tabletop_publishers:
+        return False
+    return _publisher_match_score(spiel_publishers, tabletop_publishers) >= PUBLISHER_THRESHOLD
 
 
 def fuzzy_matches(spiel_titles, tabletop_titles):
     """
-    One (spiel_title, status, best_match, score) per SPIEL game, in order.
+    Match SPIEL titles to the Tabletop Together CSV using BOTH title and publisher.
 
-    This is the expensive part (every non-exact title is scored against the whole preview list), so:
-    the preview titles are normalized once, rapidfuzz's C++ extractOne does the scanning, and the result
-    is cached (by content signature, not object identity) until the underlying data actually changes.
+    Exact title matches are accepted only when the publisher agrees (or one side has no
+    publisher). Fuzzy matches require a strong publisher match. This prevents generic
+    title similarities such as "CATAN - The Card Game" -> "Alhambra: Card Game" from
+    becoming false positives.
     """
     sig = _match_cache_signature(spiel_titles, tabletop_titles)
     with _match_lock:
         if _match_cache["sig"] == sig:
             return _match_cache["rows"]
+
     started = time.monotonic()
-    keys = [title_key(item["title"]) for item in tabletop_titles]
     display = [normalize_title(item["title"]) for item in tabletop_titles]
+    keys = [title_key(item["title"]) for item in tabletop_titles]
+
+    # Exact title can have multiple CSV records; retain all publisher variants.
     exact = {}
-    for k, d in zip(keys, display):
-        exact.setdefault(k, d)
-    scorers = (rfuzz.token_set_ratio, rfuzz.token_sort_ratio, rfuzz.ratio)
+    for i, key in enumerate(keys):
+        if key:
+            exact.setdefault(key, []).append(i)
 
     rows = []
     for spiel in spiel_titles:
         original = normalize_title(spiel["title"])
         key = title_key(original)
-        if key in exact:
-            match, score = exact[key], 100
+        spiel_publishers = spiel.get("publishers", [])
+
+        best = None  # (title_score, publisher_score, index)
+        exact_candidates = exact.get(key, [])
+        for i in exact_candidates:
+            tabletop_publishers = tabletop_titles[i].get("publishers", [])
+            pub_score = _publisher_match_score(spiel_publishers, tabletop_publishers)
+            publisher_ok = (
+                not spiel_publishers or not tabletop_publishers or
+                pub_score >= PUBLISHER_THRESHOLD
+            )
+            if publisher_ok:
+                candidate = (100, pub_score, i)
+                if best is None or candidate > best:
+                    best = candidate
+
+        if best is None and key and keys:
+            # First find title candidates, then reject candidates whose publisher conflicts.
+            candidate_indexes = set()
+            for scorer in (rfuzz.token_set_ratio, rfuzz.token_sort_ratio, rfuzz.ratio):
+                for _, score, idx in rprocess.extract(key, keys, scorer=scorer, limit=12):
+                    if score >= 70:
+                        candidate_indexes.add(idx)
+
+            for i in candidate_indexes:
+                title_score = max(
+                    rfuzz.token_set_ratio(key, keys[i]),
+                    rfuzz.token_sort_ratio(key, keys[i]),
+                    rfuzz.ratio(key, keys[i]),
+                )
+                tabletop_publishers = tabletop_titles[i].get("publishers", [])
+                pub_score = _publisher_match_score(spiel_publishers, tabletop_publishers)
+
+                # Fuzzy title matches are only eligible when both sources identify a
+                # compatible publisher. Missing publisher metadata is deliberately not
+                # enough for a fuzzy match.
+                if not _publisher_compatible(spiel_publishers, tabletop_publishers):
+                    continue
+                if title_score < 75:
+                    continue
+
+                candidate = (title_score, pub_score, i)
+                if best is None or candidate > best:
+                    best = candidate
+
+        if best is None:
+            rows.append((original, "not found", None, 0))
+            continue
+
+        title_score, pub_score, best_index = best
+        match = display[best_index]
+
+        # Keep the existing status semantics, but only after publisher validation.
+        if title_score >= 90:
+            status = "match"
+        elif title_score >= 75:
+            status = "possible match"
         else:
-            match, score = None, 0
-            if key and keys:
-                best_index, best_score = None, 0.0
-                for scorer in scorers:
-                    # score_cutoff prunes later scorers to candidates that can still beat the best so far
-                    hit = rprocess.extractOne(key, keys, scorer=scorer, score_cutoff=best_score)
-                    if hit and (best_index is None or hit[1] > best_score):
-                        best_index, best_score = hit[2], hit[1]
-                if best_index is not None:
-                    match, score = display[best_index], int(round(best_score))
-        status = "match" if match and score >= 90 else "possible match" if match and score >= 75 else "not found"
-        rows.append((original, status, match if status != "not found" else None, score))
+            status = "not found"
+
+        rows.append((
+            original,
+            status,
+            match if status != "not found" else None,
+            int(round(title_score)),
+        ))
 
     with _match_lock:
         _match_cache["sig"], _match_cache["rows"] = sig, rows
-    logger.info("Matched %d SPIEL titles against %d preview titles in %.1fs", len(spiel_titles), len(tabletop_titles), time.monotonic() - started)
+    logger.info(
+        "Publisher-aware matched %d SPIEL titles against %d preview titles in %.1fs",
+        len(spiel_titles), len(tabletop_titles), time.monotonic() - started
+    )
     return rows
 
 
