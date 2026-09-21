@@ -257,23 +257,31 @@ th{background:#f2f2f2}
 .muted{color:#666;font-size:.9em}
 button{cursor:pointer}
 #filter{padding:6px;width:min(100%,320px);margin:8px 0}
+#sort{padding:6px;margin:8px 0}
 </style></head><body>
 <h1>SPIEL novelties not in your Tabletop Together list</h1>
 {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
 {% if csv_error %}<div class="warning">CSV unavailable: {{ csv_error }}</div>{% endif %}
 <p>SPIEL novelties: {{ spiel_count }} | CSV titles: {{ csv_count }} | Not found in CSV: {{ missing|length }}</p>
 {% if missing %}
+<label for="sort">Sort alphabetically by:</label>
+<select id="sort" onchange="sortRows(this.value)">
+  <option value="name">Name</option>
+  <option value="exhibitor">Exhibitor</option>
+</select>
 <input id="filter" type="search" placeholder="Filter this list…" oninput="filterRows(this.value)">
 <table id="results">
-<tr><th>SPIEL title</th><th>Exhibitor</th><th>BoardGameGeek</th><th>SPIEL page</th></tr>
+<thead><tr><th>SPIEL title</th><th>Exhibitor</th><th>BoardGameGeek</th><th>SPIEL page</th></tr></thead>
+<tbody>
 {% for item in missing %}
 <tr>
-  <td>{{ item.title }}{% if item.note %}<div class="muted">{{ item.note }}</div>{% endif %}</td>
-  <td>{{ item.exhibitor }}</td>
+  <td data-sort-name="{{ item.title|lower }}">{{ item.title }}{% if item.note %}<div class="muted">{{ item.note }}</div>{% endif %}</td>
+  <td data-sort-exhibitor="{{ item.exhibitor|lower }}">{{ item.exhibitor }}</td>
   <td><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">Search BGG</a></td>
   <td><button type="button" data-title="{{ item.title }}" onclick="copyAndOpen(this)">Copy title &amp; open SPIEL</button></td>
 </tr>
 {% endfor %}
+</tbody>
 </table>
 {% elif not spiel_error and not csv_error %}
 <p>Every SPIEL novelty has a match in your CSV.</p>
@@ -290,10 +298,20 @@ function copyAndOpen(btn) {
     prompt("Copy this title:", title);
   }
 }
+function sortRows(field) {
+  const tbody = document.querySelector("#results tbody");
+  if (!tbody) return;
+  [...tbody.rows]
+    .sort((a, b) => {
+      const left = a.querySelector(`[data-sort-${field}]`).dataset[`sort${field[0].toUpperCase()}${field.slice(1)}`];
+      const right = b.querySelector(`[data-sort-${field}]`).dataset[`sort${field[0].toUpperCase()}${field.slice(1)}`];
+      return left.localeCompare(right, undefined, { sensitivity: "base" });
+    })
+    .forEach(row => tbody.appendChild(row));
+}
 function filterRows(q) {
   q = q.toLowerCase();
-  document.querySelectorAll("#results tr").forEach((row, i) => {
-    if (i === 0) return;   // header
+  document.querySelectorAll("#results tbody tr").forEach(row => {
     row.style.display = row.textContent.toLowerCase().includes(q) ? "" : "none";
   });
 }
