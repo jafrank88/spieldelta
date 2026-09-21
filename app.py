@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
-USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.8; +https://github.com/jafrank88/spieldelta)"
+USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.9; +https://github.com/jafrank88/spieldelta)"
 
 SPIEL_PRODUCTS_URL = os.getenv(
     "SPIEL_PRODUCTS_URL",
@@ -62,6 +62,10 @@ NAME_ONLY_THRESHOLD = int(os.getenv("BGG_NAME_ONLY_THRESHOLD", "97"))
 # How close a second-best candidate's name score can be to the top one before the name-only
 # fallback is considered too ambiguous to trust.
 NAME_ONLY_MARGIN = int(os.getenv("BGG_NAME_ONLY_MARGIN", "3"))
+# How many distinct BGG search hits get a full (all-names) check. BGG search only returns each
+# hit's PRIMARY name, so this pool is NOT filtered by name score at the search stage (see
+# resolve_bgg_game) -- raising this is cheap, since all candidates are fetched in one batched call.
+MAX_BGG_CANDIDATES = int(os.getenv("BGG_MAX_CANDIDATES", "12"))
 
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
@@ -110,7 +114,7 @@ def fetch(url, accept):
         response = requests.get(url, headers={"Accept": accept, "User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.text, None
-    except requests.RequestException as exc:
+    except requests.RequestException:
         logger.exception("Request failed for %s", url)
         return None, f"Could not load data from {url}."
 
@@ -168,8 +172,8 @@ def get_spiel_novelties():
         return [], error
     try:
         data = json.loads(raw)
-    except ValueError as exc:
-        logger.exception("SPIEL response was not JSON: %s", exc)
+    except ValueError:
+        logger.exception("SPIEL response was not JSON")
         return [], "SPIEL product API returned invalid JSON."
     games, seen = [], set()
     for item in find_records(data, ("TITEL", "title", "TITLE")):
@@ -179,9 +183,10 @@ def get_spiel_novelties():
         if item_id is not None:
             key = str(item_id)
         else:
-            # No ID to disambiguate: fold in the publisher signature too, so two different games that
-            # happen to share a normalized title (but have different publishers) don't collide into one entry.
-            pub_sig = "|".join(sorted(publisher_key(p) for p in publishers if publisher_key(p)))
+            # No stable ID: fold the publisher signature into the fallback key too, so two distinct
+            # products that happen to share a normalized title (different publishers) don't collide
+            # and silently drop one of them.
+            pub_sig = publisher_key("|".join(sorted(publishers))) if publishers else ""
             key = f"{title_key(title)}::{pub_sig}"
         if not title or key in seen:
             continue
@@ -262,21 +267,22 @@ def get_preview_games():
 
 def cached_data(name, loader):
     """
-    Serves the cached value if fresh. Otherwise refreshes under a per-key lock so the (slow) network
-    loader only runs once per key even under concurrent requests; other keys are never blocked by it.
+    Serves the cached value while fresh. On expiry, only ONE caller actually re-runs the (slow,
+    network-bound) loader -- others wait on the per-key refresh lock and then reuse that result --
+    and the loader itself always runs OUTSIDE _cache_lock, so a slow fetch for one key never blocks
+    requests touching a different (or still-fresh) key.
     """
     now = time.monotonic()
     with _cache_lock:
         timestamp, data, error = _cache[name]
         if now - timestamp < CACHE_TTL:
             return data, error
-
     with _cache_refresh_locks[name]:
-        # Re-check: another thread may have refreshed it while we were waiting for this lock.
+        now = time.monotonic()
         with _cache_lock:
             timestamp, data, error = _cache[name]
-        if time.monotonic() - timestamp < CACHE_TTL:
-            return data, error
+            if now - timestamp < CACHE_TTL:
+                return data, error
         data, error = loader()
         with _cache_lock:
             _cache[name] = (time.monotonic(), data, error)
@@ -305,8 +311,9 @@ def bgg_get(endpoint, params, attempts=4):
     for attempt in range(1, attempts + 1):
         with _bgg_lock:
             wait = BGG_MIN_INTERVAL - (time.monotonic() - _bgg_last_call)
-            if wait > 0:
-                time.sleep(wait)
+        if wait > 0:
+            time.sleep(wait)
+        with _bgg_lock:
             _bgg_last_call = time.monotonic()
         try:
             response = requests.get(f"{BGG_API_BASE}/{endpoint}", params=params, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -386,14 +393,7 @@ def get_bgg_things(ids):
 def resolve_bgg_game(game, trace=None):
     """
     Find the BGG game whose name AND publisher both match this SPIEL entry.
-    Returns (match, reason): match is {"id": int, "name": str, "note": str|None} or None;
-    reason says why there is no match.
-
-    If no candidate clears both the name and publisher thresholds (common for brand-new SPIEL
-    novelties whose BGG page has no publisher listed yet), and exactly one candidate has a
-    near-exact name match with no other candidate close behind, that candidate is accepted as a
-    name-only fallback match, flagged with a "note" so the mismatch stays visible.
-
+    Returns (match, reason): match is {"id": int, "name": str} or None; reason says why there is no match.
     At most two API calls: search, then a batched thing lookup (skipped for candidates already in the thing cache).
     Pass a list as `trace` to collect the raw scores (used by /bgg-why).
     """
@@ -418,48 +418,59 @@ def resolve_bgg_game(game, trace=None):
     if not found:
         return None, "BGG search returned no results"
 
-    candidates = [cid for sc, cid, _ in found if sc >= NAME_THRESHOLD][:8]
-    if not candidates:
-        top = found[0]
-        return None, f"no BGG name close enough (closest: '{top[2]}' at {int(top[0])}%, need {NAME_THRESHOLD}%)"
+    # IMPORTANT: BGG's search endpoint only returns each hit's PRIMARY name, even when the query
+    # actually matched one of its alternate names -- common for games with a non-English primary
+    # name (e.g. BGG id 7805's primary name is "Geister, Geister, Schatzsuchmeister!", with
+    # "Fearsome Floors" only listed as an alternate name). Filtering candidates by THIS score would
+    # wrongly discard those real matches. So no threshold is applied here -- just take the top-N
+    # distinct ids (search is already sorted best-first); the real, alternate-name-aware check
+    # happens below via best_name_score() once every candidate's full name list is fetched.
+    candidates, seen_ids = [], set()
+    for _, cid, _ in found:
+        if cid not in seen_ids:
+            seen_ids.add(cid)
+            candidates.append(cid)
+        if len(candidates) >= MAX_BGG_CANDIDATES:
+            break
 
-    best, closest_pub, evaluated = None, None, []
+    best, closest_pub, best_name_seen, name_only_hits = None, None, None, []
     for cid, thing in get_bgg_things(candidates):
         name_score = best_name_score(spiel_key, thing["names"])
         pub_score = best_publisher_score(game["publishers"], thing["publishers"])
-        evaluated.append((cid, thing, name_score, pub_score))
         if trace is not None:
             trace.append({"step": "candidate", "id": cid, "bgg_name": thing["primary"], "name_score": name_score,
                           "bgg_publishers": thing["publishers"], "spiel_publishers": game["publishers"], "publisher_score": pub_score})
+        if best_name_seen is None or name_score > best_name_seen[0]:
+            best_name_seen = (name_score, thing["primary"])
+        if name_score >= NAME_ONLY_THRESHOLD:
+            name_only_hits.append((name_score, cid, thing))
         if name_score >= NAME_THRESHOLD and pub_score >= PUBLISHER_THRESHOLD:
             rank = name_score + pub_score
             if best is None or rank > best[0]:
-                best = (rank, {"id": int(cid), "name": thing["primary"], "note": None})
+                best = (rank, {"id": int(cid), "name": thing["primary"]})
         elif name_score >= NAME_THRESHOLD and (closest_pub is None or pub_score > closest_pub[0]):
             closest_pub = (pub_score, cid, thing)
     if best:
         return best[1], "matched"
 
-    # Name-only fallback: exactly one candidate near-exact on name, no close runner-up.
-    by_name = sorted(evaluated, key=lambda e: -e[2])
-    if by_name:
-        top_cid, top_thing, top_name_score, top_pub_score = by_name[0]
-        runner_up_score = by_name[1][2] if len(by_name) > 1 else -1
-        if top_name_score >= NAME_ONLY_THRESHOLD and (top_name_score - runner_up_score) >= NAME_ONLY_MARGIN:
-            bgg_pubs = ", ".join(top_thing["publishers"][:4]) or "none listed yet"
-            spiel_pubs = ", ".join(game["publishers"]) or "none listed"
-            note = (f"name-only match ({top_name_score}%); publisher not confirmed "
-                    f"({top_pub_score}%, need {PUBLISHER_THRESHOLD}%): SPIEL says '{spiel_pubs}', BGG lists {bgg_pubs}")
+    # Fallback for new/small-press games whose BGG publisher field is empty or mismatched: accept a
+    # single near-exact name match (checked across ALL of its names) if no other candidate is close.
+    if name_only_hits:
+        name_only_hits.sort(key=lambda t: -t[0])
+        top_score, top_cid, top_thing = name_only_hits[0]
+        runner_up_score = name_only_hits[1][0] if len(name_only_hits) > 1 else -1
+        if top_score - runner_up_score >= NAME_ONLY_MARGIN:
             if trace is not None:
-                trace.append({"step": "name_only_fallback", "id": top_cid, "name_score": top_name_score,
-                              "runner_up_score": runner_up_score, "note": note})
-            return {"id": int(top_cid), "name": top_thing["primary"], "note": note}, "matched (name-only fallback)"
+                trace.append({"step": "name-only-fallback", "id": top_cid, "bgg_name": top_thing["primary"], "name_score": top_score})
+            return {"id": int(top_cid), "name": top_thing["primary"]}, "matched (name only; publisher not confirmed)"
 
     if closest_pub:
         pub_score, cid, thing = closest_pub
         bgg_pubs = ", ".join(thing["publishers"][:4]) or "none listed yet"
         return None, (f"BGG has '{thing['primary']}' (id {cid}) but the publisher didn't match "
                       f"({int(pub_score)}%, need {PUBLISHER_THRESHOLD}%): SPIEL says '{', '.join(game['publishers'])}', BGG lists {bgg_pubs}")
+    if best_name_seen and best_name_seen[0] < NAME_THRESHOLD:
+        return None, f"no BGG name close enough (closest: '{best_name_seen[1]}' at {int(best_name_seen[0])}%, need {NAME_THRESHOLD}%)"
     return None, "no BGG candidate passed the name check"
 
 
@@ -505,10 +516,7 @@ def _bgg_worker(games):
         except Exception:
             logger.exception("BGG lookup failed for %s", game["title"])
             continue  # not cached, so it is retried on the next worker run
-        if match:
-            entry = {"id": match["id"], "name": match["name"], "reason": match.get("note") or ""}
-        else:
-            entry = {"id": None, "reason": reason}
+        entry = {"id": match["id"] if match else None, "name": match["name"] if match else None, "reason": reason}
         entry.update(checked=int(time.time()), sig=game_signature(game))
         with _bgg_lock:
             _bgg_results[game["key"]] = entry
@@ -563,14 +571,18 @@ def build_bgg_cache():
 # --- Comparison ---------------------------------------------------------------
 
 _match_lock = threading.Lock()
-_match_cache = {"signature": None, "rows": None}
+_match_cache = {"sig": None, "rows": None}
 
 
-def _match_cache_signature(spiel_titles, tabletop_titles):
-    """A cheap content hash so the (expensive) fuzzy match is only redone when the underlying data changes."""
-    spiel_sig = tuple((g.get("key"), g["title"]) for g in spiel_titles)
-    tabletop_sig = tuple(t["title"] for t in tabletop_titles)
-    return hash((spiel_sig, tabletop_sig))
+def _titles_signature(spiel_titles, tabletop_titles):
+    """
+    Content-based signature (not object identity) so the fuzzy-match cache stays correct even if a
+    loader ever returns a new-but-equal list instead of the same cached object.
+    """
+    return (
+        tuple((g.get("key"), g["title"]) for g in spiel_titles),
+        tuple(t["title"] for t in tabletop_titles),
+    )
 
 
 def fuzzy_matches(spiel_titles, tabletop_titles):
@@ -579,11 +591,11 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
 
     This is the expensive part (every non-exact title is scored against the whole preview list), so:
     the preview titles are normalized once, rapidfuzz's C++ extractOne does the scanning, and the result
-    is cached (by content signature, not object identity) until the underlying data lists change.
+    is cached until the underlying data actually changes (by content, not just object identity).
     """
-    signature = _match_cache_signature(spiel_titles, tabletop_titles)
     with _match_lock:
-        if _match_cache["signature"] == signature:
+        sig = _titles_signature(spiel_titles, tabletop_titles)
+        if _match_cache["sig"] == sig:
             return _match_cache["rows"]
         started = time.monotonic()
         keys = [title_key(item["title"]) for item in tabletop_titles]
@@ -613,7 +625,7 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
             status = "match" if match and score >= 90 else "possible match" if match and score >= 75 else "not found"
             rows.append((original, status, match if status != "not found" else None, score))
 
-        _match_cache["signature"], _match_cache["rows"] = signature, rows
+        _match_cache["sig"], _match_cache["rows"] = sig, rows
         logger.info("Matched %d SPIEL titles against %d preview titles in %.1fs", len(spiel_titles), len(tabletop_titles), time.monotonic() - started)
         return rows
 
@@ -626,7 +638,10 @@ def compare_titles(spiel_titles, tabletop_titles):
         bgg_reason = ""
         if bgg and bgg.get("id"):
             bgg_url, bgg_kind = bgg_game_url(bgg["id"]), "direct"
-            bgg_reason = bgg.get("reason", "")  # e.g. name-only fallback note, still shown for transparency
+            # Even on a direct match, surface the caveat when it came from the name-only fallback
+            # (publisher could not be confirmed against BGG).
+            if "not confirmed" in (bgg.get("reason") or ""):
+                bgg_reason = bgg["reason"]
         else:
             bgg_url, bgg_kind = bgg_search_url(original), "search"
             if not BGG_API_TOKEN:
@@ -684,7 +699,8 @@ def bgg_why():
     with _bgg_lock:
         cached = _bgg_results.get(game["key"])
     return jsonify(spiel_game={k: game[k] for k in ("id", "title", "raw_title", "publishers", "hall", "booth")},
-                   thresholds={"name": NAME_THRESHOLD, "publisher": PUBLISHER_THRESHOLD, "name_only": NAME_ONLY_THRESHOLD},
+                   thresholds={"name": NAME_THRESHOLD, "publisher": PUBLISHER_THRESHOLD,
+                               "name_only": NAME_ONLY_THRESHOLD, "name_only_margin": NAME_ONLY_MARGIN},
                    result=match, reason=reason, cached_entry=cached, trace=trace)
 
 
@@ -727,7 +743,7 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
 {% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
 {% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
-{% if rows %}<p><small>Click a column heading to sort.</small></p>
+{% if rows %}<p><small>Click a column heading to sort (Title, Publisher, Hall, Booth, Match, Status, Confidence, or BGG).</small></p>
 <table id="results"><thead><tr><th class="sortable">SPIEL title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">Tabletop Together match</th><th class="sortable">Status</th><th class="sortable">Confidence</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td><td>{{ item.best_match or "-" }}</td><td class="status-{{ item.status|replace(' ','-') }}">{{ item.status }}</td><td data-sort="{{ item.confidence }}">{{ item.confidence }}%</td>{% if item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">search</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
 <script>
 (function () {
@@ -741,12 +757,18 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
     var v = cell.getAttribute("data-sort");
     return (v !== null ? v : cell.textContent).trim();
   }
+  function isNumericCol(col) {
+    var v = tbody.rows.length ? tbody.rows[0].cells[col].getAttribute("data-sort") : null;
+    return v !== null && !isNaN(parseFloat(v));
+  }
   function sortBy(col, dir) {
+    var numeric = isNumericCol(col);
     var rows = Array.prototype.slice.call(tbody.rows);
     rows.sort(function (a, b) {
       var x = cellValue(a, col), y = cellValue(b, col);
       var ex = (x === "" || x === "-"), ey = (y === "" || y === "-");
       if (ex !== ey) return ex ? 1 : -1;  // empty cells always last
+      if (numeric) return dir * (parseFloat(x) - parseFloat(y));
       return dir * collator.compare(x, y);
     });
     rows.forEach(function (r) { tbody.appendChild(r); });
