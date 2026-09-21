@@ -112,11 +112,12 @@ def get_spiel_novelties():
         if not title or key in seen:
             continue
         seen.add(key)
+        exhibitor = html.unescape(str(item.get("UNTERTITEL") or "")).strip()
         games.append({
             "id": item_id,
             "title": title,
             # UNTERTITEL is the exhibitor/publisher line shown under the title.
-            "exhibitor": html.unescape(str(item.get("UNTERTITEL") or "")).strip(),
+            "exhibitor": exhibitor,
         })
     logger.info("Fetched %d SPIEL products", len(games))
     if not games:
@@ -213,6 +214,8 @@ def missing_from_csv(novelties, csv_titles, threshold=FUZZY_THRESHOLD):
     exact, by_len = build_index(csv_titles)
     missing = []
     for item in novelties:
+        if not item.get("exhibitor", "").strip():
+            continue
         key = title_key(item["title"])
         note = ""
         if key in exact:
@@ -301,10 +304,11 @@ function copyAndOpen(btn) {
 function sortRows(field) {
   const tbody = document.querySelector("#results tbody");
   if (!tbody) return;
+  const prop = field === "name" ? "sortName" : "sortExhibitor";
   [...tbody.rows]
     .sort((a, b) => {
-      const left = a.querySelector(`[data-sort-${field}]`).dataset[`sort${field[0].toUpperCase()}${field.slice(1)}`];
-      const right = b.querySelector(`[data-sort-${field}]`).dataset[`sort${field[0].toUpperCase()}${field.slice(1)}`];
+      const left = a.querySelector(`[data-${prop.toLowerCase()}]`)?.dataset[prop] ?? "";
+      const right = b.querySelector(`[data-${prop.toLowerCase()}]`)?.dataset[prop] ?? "";
       return left.localeCompare(right, undefined, { sensitivity: "base" });
     })
     .forEach(row => tbody.appendChild(row));
