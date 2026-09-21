@@ -265,12 +265,11 @@ button{cursor:pointer}
 {% if missing %}
 <input id="filter" type="search" placeholder="Filter this list…" oninput="filterRows(this.value)">
 <table id="results">
-<tr><th>SPIEL title</th><th>Exhibitor</th><th>Closest CSV entry</th><th>BoardGameGeek</th><th>SPIEL page</th></tr>
+<tr><th>SPIEL title</th><th>Exhibitor</th><th>BoardGameGeek</th><th>SPIEL page</th></tr>
 {% for item in missing %}
 <tr>
   <td>{{ item.title }}{% if item.note %}<div class="muted">{{ item.note }}</div>{% endif %}</td>
   <td>{{ item.exhibitor }}</td>
-  <td>{% if item.closest %}{{ item.closest }} <span class="muted">({{ item.closest_score }}%)</span>{% else %}-{% endif %}</td>
   <td><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">Search BGG</a></td>
   <td><button type="button" data-title="{{ item.title }}" onclick="copyAndOpen(this)">Copy title &amp; open SPIEL</button></td>
 </tr>
