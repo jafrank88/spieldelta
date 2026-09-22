@@ -67,6 +67,13 @@ NAME_ONLY_MARGIN = int(os.getenv("BGG_NAME_ONLY_MARGIN", "3"))
 # resolve_bgg_game) -- raising this is cheap, since all candidates are fetched in one batched call.
 MAX_BGG_CANDIDATES = int(os.getenv("BGG_MAX_CANDIDATES", "20"))
 
+# Manual BGG link corrections, for SPIEL novelties where the automatic search/publisher matching
+# gets it wrong or can't find a candidate at all (see /bgg-why). Two required columns: spiel_title,
+# bgg_id; an optional third column, note, is shown next to the link. This file is entirely optional --
+# an override always wins over an automatic API match, and a game with an override is never sent to
+# the BGG API at all, so it also saves calls. Missing file = no overrides, not an error.
+OVERRIDES_CSV = os.getenv("OVERRIDES_CSV", "bgg_overrides.csv").strip()
+
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
 # One lock per cache key so a slow fetch for "spiel" doesn't block a concurrent request for "tabletop",
@@ -80,6 +87,9 @@ _bgg_cache_loaded = False
 _bgg_thread = None
 _bgg_disabled_reason = None
 _bgg_last_call = 0.0  # guarded by _bgg_lock (see bgg_get)
+
+_overrides_lock = threading.Lock()
+_overrides_cache = {"loaded_at": 0.0, "data": {}, "error": None}
 
 GENERIC_PUBLISHER_WORDS = {
     "games", "game", "spiele", "spiel", "verlag", "gmbh", "co", "kg", "ltd", "llc", "inc", "sl", "srl",
@@ -218,7 +228,7 @@ def add_tabletop_title(results_by_key, value, publishers=""):
     if not key or len(value) > 180 or key in {"title", "name", "game", "games", "sort", "filter", "search"}:
         return
     entry = results_by_key.setdefault(key, {"title": value, "publishers": []})
-    raw_publishers = re.split(r"[,;]|•|\\s+/\\s+", str(publishers or ""))
+    raw_publishers = re.split(r"[,;]|\u2022|\s+/\s+", str(publishers or ""))
     for publisher in raw_publishers:
         publisher = normalize_title(publisher)
         if publisher and publisher.casefold() not in {p.casefold() for p in entry["publishers"]}:
@@ -288,6 +298,71 @@ def get_preview_games():
         rows[0][publisher_index] if publisher_index is not None else None,
     )
     return (results, None) if results else ([], f"No titles found in {os.path.basename(path)}.")
+
+
+# --- Manual BGG overrides -----------------------------------------------------
+
+def load_overrides_file():
+    path = OVERRIDES_CSV if os.path.isabs(OVERRIDES_CSV) else os.path.join(APP_DIR, OVERRIDES_CSV)
+    if not os.path.exists(path):
+        return {}, None  # optional file: no overrides yet is not an error
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            text = fh.read()
+    except OSError as exc:
+        logger.warning("Could not read %s", path)
+        return {}, f"Could not read override CSV {path}: {exc.strerror or exc}"
+
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    rows = [r for r in csv.reader(io.StringIO(text), dialect) if any(c.strip() for c in r)]
+    if not rows:
+        return {}, None
+    header = [normalize_title(h).casefold() for h in rows[0]]
+    if "spiel_title" not in header or "bgg_id" not in header:
+        return {}, f"{os.path.basename(path)} needs 'spiel_title' and 'bgg_id' columns (found: {', '.join(rows[0])})."
+    title_i, id_i = header.index("spiel_title"), header.index("bgg_id")
+    note_i = header.index("note") if "note" in header else None
+
+    data, dupes, bad_ids = {}, [], []
+    for row in rows[1:]:
+        if title_i >= len(row) or id_i >= len(row):
+            continue
+        title, raw_id = row[title_i].strip(), row[id_i].strip()
+        if not title or not raw_id:
+            continue
+        match = re.search(r"(\d+)\s*$", raw_id)  # accepts a bare id or a pasted boardgamegeek.com/boardgame/<id> URL
+        if not match:
+            bad_ids.append(f"{title!r}: {raw_id!r}")
+            continue
+        key = title_key(title)
+        if key in data:
+            dupes.append(title)
+        data[key] = {
+            "id": int(match.group(1)),
+            "title": title,
+            "note": row[note_i].strip() if note_i is not None and note_i < len(row) else "",
+        }
+    if dupes:
+        logger.warning("%s has more than one row for: %s (last row wins)", os.path.basename(path), ", ".join(sorted(set(dupes))))
+    if bad_ids:
+        logger.warning("%s has rows with no numeric bgg_id, skipped: %s", os.path.basename(path), "; ".join(bad_ids))
+    logger.info("Loaded %d BGG overrides from %s", len(data), path)
+    return data, None
+
+
+def get_overrides():
+    """Manual BGG link corrections, keyed by normalized SPIEL title. Cached like the other data sources."""
+    now = time.monotonic()
+    with _overrides_lock:
+        if _overrides_cache["loaded_at"] and now - _overrides_cache["loaded_at"] < CACHE_TTL:
+            return _overrides_cache["data"], _overrides_cache["error"]
+    data, error = load_overrides_file()
+    with _overrides_lock:
+        _overrides_cache.update(loaded_at=now, data=data, error=error)
+    return data, error
 
 
 def cached_data(name, loader):
@@ -368,7 +443,7 @@ def title_variants(value):
     normalized = normalize_title(value)
     key = title_key(normalized)
     variants = []
-    for candidate in (key, re.sub(r"\s*[:–—-]\s*.*$", "", key), re.sub(r"\s+", " ", key.replace(" - ", " "))):
+    for candidate in (key, re.sub(r"\s*[:\u2013\u2014-]\s*.*$", "", key), re.sub(r"\s+", " ", key.replace(" - ", " "))):
         candidate = candidate.strip()
         if candidate and candidate not in variants:
             variants.append(candidate)
@@ -646,11 +721,18 @@ def build_bgg_cache():
     if error:
         print(f"{error} Refusing to look up every game without knowing which are already on the list.")
         return 1
+    overrides, overrides_error = get_overrides()
+    if overrides_error:
+        print(f"Warning: {overrides_error}")
     load_bgg_cache()
-    delta = delta_games(games, compare_titles(games, tabletop))
+    row_matches = compare_titles(games, tabletop, overrides)
+    not_on_list = delta_games(games, row_matches)  # before removing overridden games, for the summary line below
+    delta = delta_games(games, row_matches, overrides)
     pending = [g for g in delta if not cache_entry_fresh(_bgg_results.get(g["key"]), g)]
     calls = 3 * len(pending)
-    print(f"{len(games)} SPIEL games, {len(delta)} not on the Tabletop Together list, {len(pending)} need lookup (~{calls * BGG_MIN_INTERVAL / 60:.0f} min at worst).")
+    print(f"{len(games)} SPIEL games, {len(not_on_list)} not on the Tabletop Together list "
+          f"({len(not_on_list) - len(delta)} of those already covered by bgg_overrides.csv), "
+          f"{len(pending)} need an API lookup (~{calls * BGG_MIN_INTERVAL / 60:.0f} min at worst).")
     _bgg_worker(pending)
     direct = sum(1 for g in delta if (_bgg_results.get(g["key"]) or {}).get("id"))
     print(f"Done: {direct}/{len(delta)} direct matches. Cache written to {BGG_CACHE_FILE}")
@@ -794,24 +876,30 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
     return rows
 
 
-def compare_titles(spiel_titles, tabletop_titles):
+def compare_titles(spiel_titles, tabletop_titles, overrides=None):
+    overrides = overrides or {}
     results = []
     for spiel, (original, status, match, score) in zip(spiel_titles, fuzzy_matches(spiel_titles, tabletop_titles)):
-        with _bgg_lock:
-            bgg = _bgg_results.get(spiel.get("key"))
+        override = overrides.get(title_key(original))
         bgg_reason = ""
-        if bgg and bgg.get("id"):
-            bgg_url, bgg_kind = bgg_game_url(bgg["id"]), "direct"
-            if bgg.get("publisher_confirmed") is False:
-                bgg_reason = "matched on name only; publisher not confirmed"
+        if override:
+            bgg_url, bgg_kind = bgg_game_url(override["id"]), "override"
+            bgg_reason = override.get("note", "")
         else:
-            bgg_url, bgg_kind = bgg_search_url(original), "search"
-            if not BGG_API_TOKEN:
-                bgg_reason = "BGG lookups are off (BGG_API_TOKEN not set)"
-            elif bgg:
-                bgg_reason = bgg.get("reason", "")
-            elif status in BGG_LOOKUP_STATUSES:
-                bgg_reason = "not looked up yet"
+            with _bgg_lock:
+                bgg = _bgg_results.get(spiel.get("key"))
+            if bgg and bgg.get("id"):
+                bgg_url, bgg_kind = bgg_game_url(bgg["id"]), "direct"
+                if bgg.get("publisher_confirmed") is False:
+                    bgg_reason = "matched on name only; publisher not confirmed"
+            else:
+                bgg_url, bgg_kind = bgg_search_url(original), "search"
+                if not BGG_API_TOKEN:
+                    bgg_reason = "BGG lookups are off (BGG_API_TOKEN not set)"
+                elif bgg:
+                    bgg_reason = bgg.get("reason", "")
+                elif status in BGG_LOOKUP_STATUSES:
+                    bgg_reason = "not looked up yet"
 
         results.append({
             "spiel_title": original,
@@ -828,9 +916,14 @@ def compare_titles(spiel_titles, tabletop_titles):
     return results
 
 
-def delta_games(spiel, matches):
-    """SPIEL games missing from the Tabletop Together list. compare_titles returns one row per game, in order."""
-    return [g for g, m in zip(spiel, matches) if m["status"] in BGG_LOOKUP_STATUSES]
+def delta_games(spiel, matches, overrides=None):
+    """
+    SPIEL games missing from the Tabletop Together list AND not already covered by a manual override.
+    compare_titles returns one row per game, in order. Overridden games are excluded so they never cost an API call.
+    """
+    overrides = overrides or {}
+    return [g for g, m in zip(spiel, matches)
+            if m["status"] in BGG_LOOKUP_STATUSES and title_key(g["title"]) not in overrides]
 
 
 @app.route("/bgg-why")
@@ -851,6 +944,12 @@ def bgg_why():
     game = next((g for g in spiel if title_key(g["title"]) == wanted), None) or next((g for g in spiel if wanted in title_key(g["title"])), None)
     if not game:
         return jsonify(error=f"No SPIEL novelty with a title like '{request.args.get('title')}'"), 404
+    overrides, _ = get_overrides()
+    override = overrides.get(title_key(game["title"]))
+    if override:
+        return jsonify(spiel_game={k: game[k] for k in ("id", "title", "raw_title", "publishers", "hall", "booth")},
+                       result={"id": override["id"]}, reason=f"served from bgg_overrides.csv: {override.get('note') or 'no note'}",
+                       cached_entry=None, trace=[])
     trace = []
     try:
         match, reason = resolve_bgg_game(game, trace)
@@ -876,11 +975,12 @@ def index():
         return "", 200
     spiel, spiel_error = cached_data("spiel", get_spiel_novelties)
     tabletop, tabletop_error = cached_data("tabletop", get_preview_games)
+    overrides, overrides_error = get_overrides()
     if not _bgg_cache_loaded:
         load_bgg_cache()
-    matches = compare_titles(spiel, tabletop) if spiel and tabletop else []
+    matches = compare_titles(spiel, tabletop, overrides) if spiel and tabletop else []
     # If either source failed, matches is empty and NO BGG calls are made (never fall back to looking up everything).
-    delta = delta_games(spiel, matches) if matches else []
+    delta = delta_games(spiel, matches, overrides) if matches else []
     ensure_bgg_worker(delta)
     # Only novelties that are NOT already on the CSV are listed. Add ?all=1 to the URL to see every row (for debugging).
     show_all = request.args.get("all") == "1"
@@ -895,17 +995,18 @@ def index():
 <html><head><title>SPIEL novelties not on the Tabletop Together list</title>
 {% if bgg_pending %}<meta http-equiv="refresh" content="60">{% endif %}
 <style>
-body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}.bgg-search{color:#888}.bgg-reason{color:#888;font-size:11px}th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th[data-dir=asc]::after{content:" \\25B2"}th[data-dir=desc]::after{content:" \\25BC"}
+body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}.bgg-search{color:#888}.bgg-reason{color:#888;font-size:11px}.bgg-override{color:#1a7f37;font-weight:bold}.bgg-override-tag{color:#1a7f37;font-weight:normal;font-size:11px}th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th[data-dir=asc]::after{content:" \\25B2"}th[data-dir=desc]::after{content:" \\25BC"}
 </style></head><body><h1>SPIEL novelties not on the Tabletop Together list</h1>
 {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
 {% if tabletop_error %}<div class="warning">Preview list (CSV) unavailable: {{ tabletop_error }}</div>{% endif %}
+{% if overrides_error %}<div class="warning">BGG override CSV problem: {{ overrides_error }}</div>{% endif %}
 {% if bgg_disabled_reason %}<div class="warning">BGG direct links disabled: {{ bgg_disabled_reason }}. Showing search links.</div>{% endif %}
-<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together CSV titles: {{ tabletop_count }}{% if matches %} | Not on the CSV (shown below): {{ delta_count }}{% endif %}{% if show_all %} | <b>showing all rows</b>{% endif %}
+<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together CSV titles: {{ tabletop_count }}{% if matches %} | Not on the CSV (shown below): {{ delta_count }}{% endif %}{% if overrides_count %} | Manual BGG overrides: {{ overrides_count }}{% endif %}{% if show_all %} | <b>showing all rows</b>{% endif %}
 {% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
 {% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
 {% if rows %}<p><small>Click a column heading to sort.</small></p>
-<table id="results"><thead><tr><th class="sortable">Title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td>{% if item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a></td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG search</a></td>{% endif %}</tr>{% endfor %}</tbody></table>
+<table id="results"><thead><tr><th class="sortable">Title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td>{% if item.bgg_kind == "override" %}<td data-sort="0"><a class="bgg-override" href="{{ item.bgg_url }}" target="_blank" rel="noopener" title="Manually linked (bgg_overrides.csv)">BGG page</a> <span class="bgg-override-tag">(manual)</span>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% elif item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG search</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
 <script>
 (function () {
   var table = document.getElementById("results");
@@ -946,7 +1047,7 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
 </body></html>"""
     return render_template_string(
         template, matches=matches, rows=rows, show_all=show_all, spiel_count=len(spiel), tabletop_count=len(tabletop),
-        spiel_error=spiel_error, tabletop_error=tabletop_error,
+        spiel_error=spiel_error, tabletop_error=tabletop_error, overrides_error=overrides_error, overrides_count=len(overrides),
         bgg_token=bool(BGG_API_TOKEN), delta_count=len(delta), bgg_pending=bgg_pending, bgg_resolved=bgg_resolved,
         bgg_direct=bgg_direct, bgg_disabled_reason=_bgg_disabled_reason,
     )
