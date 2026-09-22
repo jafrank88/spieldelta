@@ -22,13 +22,15 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 20
+REQUEST_CONNECT_TIMEOUT = float(os.getenv("REQUEST_CONNECT_TIMEOUT", "5"))
+REQUEST_READ_TIMEOUT = float(os.getenv("REQUEST_READ_TIMEOUT", "30"))
+REQUEST_TIMEOUT = (REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT)
 CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
 USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.10; +https://github.com/jafrank88/spieldelta)"
 
 SPIEL_PRODUCTS_URL = os.getenv(
     "SPIEL_PRODUCTS_URL",
-    "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D",
+    "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D"
 )
 # The BGG Spiel Preview / Tabletop Together list is read from a CSV committed to the repo (no website call).
 # Defaults to TabletopTogetherTool.csv next to app.py; set PREVIEW_CSV to use a different path.
@@ -148,7 +150,9 @@ def extract_publishers(item):
     """Publisher names from the INFO HTML table (falls back to UNTERTITEL)."""
     publishers = []
     info = item.get("INFO")
-    if info:
+    if isinstance(info, bytes):
+        info = info.decode("utf-8", errors="replace")
+    if isinstance(info, str) and info.strip():
         soup = BeautifulSoup(info, "html.parser")
         for row in soup.find_all("tr"):
             cells = row.find_all("td")
@@ -371,6 +375,8 @@ def cached_data(name, loader):
     OUTSIDE the main cache lock -- guarded instead by a per-key refresh lock -- so a slow fetch for
     one key never blocks requests for a different key, and two concurrent requests for the same
     stale key don't both trigger the loader (the second waits, then reuses the first's result).
+
+    If the refresh fails, keep serving the last known-good data instead of dropping the app offline.
     """
     now = time.monotonic()
     with _cache_lock:
@@ -386,6 +392,10 @@ def cached_data(name, loader):
                 return data, error
         data, error = loader()
         with _cache_lock:
+            if error and data:
+                logger.warning("Using stale cache for %s because refresh failed: %s", name, error)
+                _cache[name] = (timestamp, data, error)
+                return data, error
             _cache[name] = (time.monotonic(), data, error)
         return data, error
 
@@ -995,18 +1005,30 @@ def index():
 <html><head><title>SPIEL novelties not on the Tabletop Together list</title>
 {% if bgg_pending %}<meta http-equiv="refresh" content="60">{% endif %}
 <style>
-body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #ffcc80;margin-bottom:20px}.status-match{color:green}.status-possible-match{color:orange}.status-not-found{color:red}.bgg-search{color:#888}.bgg-reason{color:#888;font-size:11px}.bgg-override{color:#1a7f37;font-weight:bold}.bgg-override-tag{color:#1a7f37;font-weight:normal;font-size:11px}th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th[data-dir=asc]::after{content:" \\25B2"}th[data-dir=desc]::after{content:" \\25BC"}
+body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #f0d7a0}.muted{color:#555}.badge{display:inline-block;padding:2px 6px;border-radius:10px;font-size:12px;font-weight:bold}.badge.search{background:#eef5ff;color:#2455a0}.badge.direct{background:#eafaf1;color:#1f7a47}.badge.override{background:#fff4cc;color:#7a5a00}.small{font-size:12px}.status{font-weight:bold}.status.match{color:#18672d}.status.possible{color:#8a3b00}.status.notfound{color:#8a1c1c}.clickable{cursor:pointer}
 </style></head><body><h1>SPIEL novelties not on the Tabletop Together list</h1>
 {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
 {% if tabletop_error %}<div class="warning">Preview list (CSV) unavailable: {{ tabletop_error }}</div>{% endif %}
 {% if overrides_error %}<div class="warning">BGG override CSV problem: {{ overrides_error }}</div>{% endif %}
 {% if bgg_disabled_reason %}<div class="warning">BGG direct links disabled: {{ bgg_disabled_reason }}. Showing search links.</div>{% endif %}
-<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together CSV titles: {{ tabletop_count }}{% if matches %} | Not on the CSV (shown below): {{ delta_count }}{% endif %}{% if overrides_count %} | Manual BGG overrides: {{ overrides_count }}{% endif %}{% if show_all %} | <b>showing all rows</b>{% endif %}
-{% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
+<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together CSV titles: {{ tabletop_count }}{% if matches %} | Not on the CSV (shown below): {{ delta_count }}{% endif %}{% if overrides_count %} | Manual overrides loaded: {{ overrides_count }}{% endif %}{% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
 {% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
 {% if rows %}<p><small>Click a column heading to sort.</small></p>
-<table id="results"><thead><tr><th class="sortable">Title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">BGG</th></tr></thead><tbody>{% for item in rows %}<tr><td>{{ item.spiel_title }}</td><td>{{ item.publisher or "-" }}</td><td>{{ item.hall or "-" }}</td><td>{{ item.booth or "-" }}</td>{% if item.bgg_kind == "override" %}<td data-sort="0"><a class="bgg-override" href="{{ item.bgg_url }}" target="_blank" rel="noopener" title="Manually linked (bgg_overrides.csv)">BGG page</a> <span class="bgg-override-tag">(manual)</span>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% elif item.bgg_kind == "direct" %}<td data-sort="0"><a href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG page</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% else %}<td data-sort="1"><a class="bgg-search" href="{{ item.bgg_url }}" target="_blank" rel="noopener">BGG search</a>{% if item.bgg_reason %}<br><small class="bgg-reason">{{ item.bgg_reason }}</small>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
+<table id="results"><thead><tr><th class="sortable">Title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">BGG</th></tr></thead><tbody>
+{% for r in rows %}
+<tr>
+  <td>{{ r.spiel_title }}</td>
+  <td>{{ r.publisher or "-" }}</td>
+  <td>{{ r.hall or "-" }}</td>
+  <td>{{ r.booth or "-" }}</td>
+  <td>
+    {% if r.bgg_kind == "override" %}<span class="badge override">override</span>{% elif r.bgg_kind == "direct" %}<span class="badge direct">direct</span>{% else %}<span class="badge search">search</span>{% endif %}
+    <a href="{{ r.bgg_url }}">{{ r.bgg_reason or "BGG link" }}</a>
+  </td>
+</tr>
+{% endfor %}
+</tbody></table>
 <script>
 (function () {
   var table = document.getElementById("results");
