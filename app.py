@@ -14,7 +14,7 @@ from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 from rapidfuzz import fuzz as rfuzz, process as rprocess
 from thefuzz import fuzz
 
@@ -80,6 +80,7 @@ MAX_BGG_CANDIDATES = int(os.getenv("BGG_MAX_CANDIDATES", "20"))
 # an override always wins over an automatic API match, and a game with an override is never sent to
 # the BGG API at all, so it also saves calls. Missing file = no overrides, not an error.
 OVERRIDES_CSV = os.getenv("OVERRIDES_CSV", "bgg_overrides.csv").strip()
+BGG_ADMIN_KEY = os.getenv("BGG_ADMIN_KEY", "").strip()
 
 _cache_lock = threading.Lock()
 _cache = {"spiel": (0.0, [], None), "tabletop": (0.0, [], None)}
@@ -442,6 +443,53 @@ def find_override(overrides, game):
     if game_id is not None and str(game_id) in by_id:
         return by_id[str(game_id)]
     return by_title.get(title_key(game.get("title", "")))
+
+
+def save_bgg_override(spiel_id, spiel_title, bgg_id):
+    """Update one override row atomically and invalidate the in-memory override cache."""
+    path = OVERRIDES_CSV if os.path.isabs(OVERRIDES_CSV) else os.path.join(APP_DIR, OVERRIDES_CSV)
+    with _overrides_lock:
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8-sig", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    fieldnames = list(reader.fieldnames or [])
+                    rows = list(reader)
+            else:
+                fieldnames = ["spiel_id", "spiel_title", "bgg_id", "note"]
+                rows = []
+            if "spiel_id" not in fieldnames or "spiel_title" not in fieldnames or "bgg_id" not in fieldnames:
+                return False, "The override CSV must contain spiel_id, spiel_title, and bgg_id columns."
+            if "note" not in fieldnames:
+                fieldnames.append("note")
+
+            found = False
+            for row in rows:
+                if str(row.get("spiel_id", "")).strip() == str(spiel_id):
+                    row["spiel_title"] = spiel_title
+                    row["bgg_id"] = str(bgg_id)
+                    row["note"] = "Added via web UI"
+                    found = True
+                    break
+            if not found:
+                rows.append({
+                    "spiel_id": str(spiel_id),
+                    "spiel_title": spiel_title,
+                    "bgg_id": str(bgg_id),
+                    "note": "Added via web UI",
+                })
+
+            temporary_file = f"{path}.tmp"
+            with open(temporary_file, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(temporary_file, path)
+            _overrides_cache.update(loaded_at=0.0, data={}, error=None)
+            return True, None
+        except OSError as exc:
+            logger.exception("Could not save BGG override")
+            return False, f"Could not save override CSV: {exc}"
 
 
 def cached_data(name, loader):
