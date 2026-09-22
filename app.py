@@ -37,6 +37,10 @@ SPIEL_PRODUCTS_URL = os.getenv(
 # (Set PREVIEW_CSV="" to auto-detect the only *.csv file next to app.py instead.)
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PREVIEW_CSV = os.getenv("PREVIEW_CSV", "TabletopTogetherTool.csv").strip()
+SPIEL_CACHE_TTL = int(os.getenv("SPIEL_CACHE_TTL", "900"))
+SPIEL_CACHE_FILE = os.getenv(
+    "SPIEL_CACHE_FILE", os.path.join(APP_DIR, "spiel_novelties_cache.json")
+)
 
 # --- BGG direct-link resolution -------------------------------------------
 # BGG's XML API2 requires a registered application token (Bearer auth).
@@ -70,8 +74,9 @@ NAME_ONLY_MARGIN = int(os.getenv("BGG_NAME_ONLY_MARGIN", "3"))
 MAX_BGG_CANDIDATES = int(os.getenv("BGG_MAX_CANDIDATES", "20"))
 
 # Manual BGG link corrections, for SPIEL novelties where the automatic search/publisher matching
-# gets it wrong or can't find a candidate at all (see /bgg-why). Two required columns: spiel_title,
-# bgg_id; an optional third column, note, is shown next to the link. This file is entirely optional --
+# gets it wrong or can't find a candidate at all (see /bgg-why). Required columns: spiel_title and
+# bgg_id; add spiel_id to key a row by the stable SPIEL product ID. An optional note is shown next to
+# the link. This file is entirely optional --
 # an override always wins over an automatic API match, and a game with an override is never sent to
 # the BGG API at all, so it also saves calls. Missing file = no overrides, not an error.
 OVERRIDES_CSV = os.getenv("OVERRIDES_CSV", "bgg_overrides.csv").strip()
@@ -223,6 +228,56 @@ def get_spiel_novelties():
     return (games, None) if games else ([], "SPIEL product API returned no products with titles and publishers.")
 
 
+def load_spiel_cache():
+    try:
+        with open(SPIEL_CACHE_FILE, encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        cached_at = float(snapshot["cached_at"])
+        games = snapshot["games"]
+        if not isinstance(games, list) or time.time() - cached_at >= SPIEL_CACHE_TTL:
+            return None
+        logger.info("Loaded %d SPIEL novelties from %s", len(games), SPIEL_CACHE_FILE)
+        return games
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_spiel_cache(games):
+    temporary_file = f"{SPIEL_CACHE_FILE}.tmp"
+    try:
+        with open(temporary_file, "w", encoding="utf-8") as fh:
+            json.dump({"cached_at": time.time(), "games": games}, fh, separators=(",", ":"))
+        os.replace(temporary_file, SPIEL_CACHE_FILE)
+    except OSError:
+        logger.warning("Could not write SPIEL cache to %s", SPIEL_CACHE_FILE)
+        try:
+            os.remove(temporary_file)
+        except OSError:
+            pass
+
+
+def get_cached_spiel_novelties():
+    cached_games = load_spiel_cache()
+    if cached_games is not None:
+        return cached_games, None
+
+    games, error = get_spiel_novelties()
+    if not error and games:
+        save_spiel_cache(games)
+        return games, None
+
+    # A stale snapshot is preferable to a blank page during a temporary API outage.
+    try:
+        with open(SPIEL_CACHE_FILE, encoding="utf-8") as fh:
+            stale_games = json.load(fh)["games"]
+        if isinstance(stale_games, list) and stale_games:
+            logger.warning("Using stale SPIEL cache because refresh failed: %s", error)
+            return stale_games, None
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return games, error
+
+
 # --- Tabletop Together -------------------------------------------------------
 
 def add_tabletop_title(results_by_key, value, publishers=""):
@@ -327,38 +382,46 @@ def load_overrides_file():
     header = [normalize_title(h).casefold() for h in rows[0]]
     if "spiel_title" not in header or "bgg_id" not in header:
         return {}, f"{os.path.basename(path)} needs 'spiel_title' and 'bgg_id' columns (found: {', '.join(rows[0])})."
-    title_i, id_i = header.index("spiel_title"), header.index("bgg_id")
+    title_i, bgg_i = header.index("spiel_title"), header.index("bgg_id")
+    spiel_id_i = header.index("spiel_id") if "spiel_id" in header else None
     note_i = header.index("note") if "note" in header else None
 
-    data, dupes, bad_ids = {}, [], []
+    data = {"by_id": {}, "by_title": {}}
+    dupes, bad_ids = [], []
     for row in rows[1:]:
-        if title_i >= len(row) or id_i >= len(row):
+        if title_i >= len(row) or bgg_i >= len(row):
             continue
-        title, raw_id = row[title_i].strip(), row[id_i].strip()
+        title, raw_id = row[title_i].strip(), row[bgg_i].strip()
         if not title or not raw_id:
             continue
         match = re.search(r"(\d+)\s*$", raw_id)  # accepts a bare id or a pasted boardgamegeek.com/boardgame/<id> URL
         if not match:
             bad_ids.append(f"{title!r}: {raw_id!r}")
             continue
-        key = title_key(title)
-        if key in data:
-            dupes.append(title)
-        data[key] = {
+        override = {
             "id": int(match.group(1)),
             "title": title,
             "note": row[note_i].strip() if note_i is not None and note_i < len(row) else "",
         }
+        title_key_value = title_key(title)
+        if title_key_value in data["by_title"]:
+            dupes.append(title)
+        data["by_title"][title_key_value] = override
+        if spiel_id_i is not None and spiel_id_i < len(row) and row[spiel_id_i].strip():
+            spiel_id = row[spiel_id_i].strip()
+            if spiel_id in data["by_id"]:
+                dupes.append(f"SPIEL ID {spiel_id}")
+            data["by_id"][spiel_id] = override
     if dupes:
         logger.warning("%s has more than one row for: %s (last row wins)", os.path.basename(path), ", ".join(sorted(set(dupes))))
     if bad_ids:
         logger.warning("%s has rows with no numeric bgg_id, skipped: %s", os.path.basename(path), "; ".join(bad_ids))
-    logger.info("Loaded %d BGG overrides from %s", len(data), path)
+    logger.info("Loaded %d BGG overrides from %s", len(data["by_title"]), path)
     return data, None
 
 
 def get_overrides():
-    """Manual BGG link corrections, keyed by normalized SPIEL title. Cached like the other data sources."""
+    """Manual BGG link corrections, keyed by SPIEL ID and normalized title."""
     now = time.monotonic()
     with _overrides_lock:
         if _overrides_cache["loaded_at"] and now - _overrides_cache["loaded_at"] < CACHE_TTL:
@@ -367,6 +430,18 @@ def get_overrides():
     with _overrides_lock:
         _overrides_cache.update(loaded_at=now, data=data, error=error)
     return data, error
+
+
+def find_override(overrides, game):
+    """Prefer the stable SPIEL product ID, then fall back to the normalized title."""
+    if not overrides:
+        return None
+    by_id = overrides.get("by_id", {})
+    by_title = overrides.get("by_title", {})
+    game_id = game.get("id")
+    if game_id is not None and str(game_id) in by_id:
+        return by_id[str(game_id)]
+    return by_title.get(title_key(game.get("title", "")))
 
 
 def cached_data(name, loader):
@@ -890,7 +965,7 @@ def compare_titles(spiel_titles, tabletop_titles, overrides=None):
     overrides = overrides or {}
     results = []
     for spiel, (original, status, match, score) in zip(spiel_titles, fuzzy_matches(spiel_titles, tabletop_titles)):
-        override = overrides.get(title_key(original))
+        override = find_override(overrides, spiel)
         bgg_reason = ""
         if override:
             bgg_url, bgg_kind = bgg_game_url(override["id"]), "override"
@@ -933,7 +1008,7 @@ def delta_games(spiel, matches, overrides=None):
     """
     overrides = overrides or {}
     return [g for g, m in zip(spiel, matches)
-            if m["status"] in BGG_LOOKUP_STATUSES and title_key(g["title"]) not in overrides]
+            if m["status"] in BGG_LOOKUP_STATUSES and not find_override(overrides, g)]
 
 
 @app.route("/bgg-why")
@@ -948,14 +1023,14 @@ def bgg_why():
     if not BGG_API_TOKEN:
         return jsonify(error="BGG_API_TOKEN is not set on this server, so no BGG lookups can happen."), 400
     wanted = title_key(request.args.get("title", ""))
-    spiel, error = cached_data("spiel", get_spiel_novelties)
+    spiel, error = cached_data("spiel", get_cached_spiel_novelties)
     if error or not wanted:
         return jsonify(error=error or "pass ?title=..."), 400
     game = next((g for g in spiel if title_key(g["title"]) == wanted), None) or next((g for g in spiel if wanted in title_key(g["title"])), None)
     if not game:
         return jsonify(error=f"No SPIEL novelty with a title like '{request.args.get('title')}'"), 404
     overrides, _ = get_overrides()
-    override = overrides.get(title_key(game["title"]))
+    override = find_override(overrides, game)
     if override:
         return jsonify(spiel_game={k: game[k] for k in ("id", "title", "raw_title", "publishers", "hall", "booth")},
                        result={"id": override["id"]}, reason=f"served from bgg_overrides.csv: {override.get('note') or 'no note'}",
@@ -983,7 +1058,7 @@ def health():
 def index():
     if request.method == "HEAD":
         return "", 200
-    spiel, spiel_error = cached_data("spiel", get_spiel_novelties)
+    spiel, spiel_error = cached_data("spiel", get_cached_spiel_novelties)
     tabletop, tabletop_error = cached_data("tabletop", get_preview_games)
     overrides, overrides_error = get_overrides()
     if not _bgg_cache_loaded:
@@ -1069,10 +1144,24 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
 </body></html>"""
     return render_template_string(
         template, matches=matches, rows=rows, show_all=show_all, spiel_count=len(spiel), tabletop_count=len(tabletop),
-        spiel_error=spiel_error, tabletop_error=tabletop_error, overrides_error=overrides_error, overrides_count=len(overrides),
+        spiel_error=spiel_error, tabletop_error=tabletop_error, overrides_error=overrides_error,
+        overrides_count=len(overrides.get("by_title", {})),
         bgg_token=bool(BGG_API_TOKEN), delta_count=len(delta), bgg_pending=bgg_pending, bgg_resolved=bgg_resolved,
         bgg_direct=bgg_direct, bgg_disabled_reason=_bgg_disabled_reason,
     )
+
+
+def warm_data_cache():
+    """Populate the data caches after a worker starts, without blocking startup."""
+    try:
+        cached_data("spiel", get_cached_spiel_novelties)
+        cached_data("tabletop", get_preview_games)
+    except Exception:
+        logger.exception("Initial data cache warm-up failed")
+
+
+if __name__ != "__main__" or len(sys.argv) == 1:
+    threading.Thread(target=warm_data_cache, daemon=True, name="data-cache-warmer").start()
 
 
 if __name__ == "__main__":
