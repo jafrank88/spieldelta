@@ -534,6 +534,14 @@ def bgg_game_url(bgg_id):
     return f"https://boardgamegeek.com/boardgame/{bgg_id}"
 
 
+def spiel_game_url(spiel_id):
+    """Official SPIEL description page for a numeric product ID."""
+    product_id = str(spiel_id or "").strip()
+    if not re.fullmatch(r"\d+", product_id):
+        return ""
+    return f"https://spiel-essen.eyeled.de/en/app.html?prj=spiel26&p={product_id}"
+
+
 class BGGAuthError(Exception):
     pass
 
@@ -1036,6 +1044,7 @@ def compare_titles(spiel_titles, tabletop_titles, overrides=None):
 
         results.append({
             "spiel_title": original,
+            "spiel_url": spiel_game_url(spiel.get("id")),
             "publisher": ", ".join(spiel.get("publishers", [])),
             "hall": spiel.get("hall", ""),
             "booth": spiel.get("booth", ""),
@@ -1141,7 +1150,7 @@ body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,
 <table id="results"><thead><tr><th class="sortable">Title</th><th class="sortable">Publisher</th><th class="sortable">Hall</th><th class="sortable">Booth</th><th class="sortable">BGG</th></tr></thead><tbody>
 {% for r in rows %}
 <tr>
-  <td>{{ r.spiel_title }}</td>
+  <td>{% if r.spiel_url %}<a href="{{ r.spiel_url }}">{{ r.spiel_title }}</a>{% else %}{{ r.spiel_title }}{% endif %}</td>
   <td>{{ r.publisher or "-" }}</td>
   <td>{{ r.hall or "-" }}</td>
   <td>{{ r.booth or "-" }}</td>
