@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import html
 import io
 import json
@@ -25,21 +26,31 @@ logger = logging.getLogger(__name__)
 REQUEST_CONNECT_TIMEOUT = float(os.getenv("REQUEST_CONNECT_TIMEOUT", "5"))
 REQUEST_READ_TIMEOUT = float(os.getenv("REQUEST_READ_TIMEOUT", "30"))
 REQUEST_TIMEOUT = (REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT)
-CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "300"))
+CACHE_TTL = int(os.getenv("DATA_CACHE_TTL", "10800"))
 USER_AGENT = "Mozilla/5.0 (compatible; spieldelta/1.10; +https://github.com/jafrank88/spieldelta)"
 
 SPIEL_PRODUCTS_URL = os.getenv(
     "SPIEL_PRODUCTS_URL",
     "https://maps.eyeled-services.de/en/spiel26/products?columns=%5B%22ID%22%2C%22INFO%22%2C%22S_ORDER%22%2C%22TITEL%22%2C%22FIRMA_ID%22%2C%22UNTERTITEL%22%2C%22BILDER%22%2C%22BILDER_VERSIONEN%22%2C%22BILDER_TEXTE%22%5D"
 )
-# The BGG Spiel Preview / Tabletop Together list is read from a CSV committed to the repo (no website call).
-# Defaults to TabletopTogetherTool.csv next to app.py; set PREVIEW_CSV to use a different path.
-# (Set PREVIEW_CSV="" to auto-detect the only *.csv file next to app.py instead.)
+# The shared Tabletop Together list is the primary source; the bundled CSV is an offline fallback.
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PREVIEW_CSV = os.getenv("PREVIEW_CSV", "TabletopTogetherTool.csv").strip()
-SPIEL_CACHE_TTL = int(os.getenv("SPIEL_CACHE_TTL", "900"))
+TTT_SHARE_URL = os.getenv(
+    "TTT_SHARE_URL",
+    "https://tabletoptogether.com/tool/share.php?key=46b4a984fef86dcddcfa5c8e5a2de1d6&c=32",
+).strip()
+TTT_CACHE_TTL = int(os.getenv("TTT_CACHE_TTL", str(CACHE_TTL)))
+TTT_CACHE_FILE = os.getenv(
+    "TTT_CACHE_FILE", os.path.join(APP_DIR, "tabletop_together_cache.json")
+)
+SPIEL_CACHE_TTL = int(os.getenv("SPIEL_CACHE_TTL", str(CACHE_TTL)))
 SPIEL_CACHE_FILE = os.getenv(
     "SPIEL_CACHE_FILE", os.path.join(APP_DIR, "spiel_novelties_cache.json")
+)
+MATCH_CACHE_TTL = int(os.getenv("MATCH_CACHE_TTL", str(CACHE_TTL)))
+MATCH_CACHE_FILE = os.getenv(
+    "MATCH_CACHE_FILE", os.path.join(APP_DIR, "spiel_match_cache.json")
 )
 
 # --- BGG direct-link resolution -------------------------------------------
@@ -59,7 +70,7 @@ BGG_THING_TTL = float(os.getenv("BGG_THING_TTL_DAYS", "7")) * 86400
 # Only SPIEL games NOT already on the Tabletop Together / BGG Spiel Preview list get a BGG API lookup.
 # "possible match" (fuzzy 75-89) is ambiguous, so it is looked up too; set to "not found" to be stricter.
 BGG_LOOKUP_STATUSES = {x.strip() for x in os.getenv("BGG_LOOKUP_STATUSES", "not found,possible match").split(",") if x.strip()}
-# BGG thresholds (0-100). CSV matching also uses PUBLISHER_THRESHOLD as a hard fuzzy-match gate.
+# BGG thresholds (0-100). Tabletop Together matching also uses PUBLISHER_THRESHOLD as a hard fuzzy-match gate.
 NAME_THRESHOLD = int(os.getenv("BGG_NAME_THRESHOLD", "90"))
 PUBLISHER_THRESHOLD = int(os.getenv("BGG_PUBLISHER_THRESHOLD", "85"))
 # Fallback for new/small-press games whose BGG publisher field is empty or mismatched:
@@ -120,9 +131,18 @@ def title_key(value):
     return " ".join(word for word in value.split() if word not in {"a", "an", "the"})
 
 
+def normalize_publisher(value):
+    if value is None:
+        return ""
+    value = html.unescape(str(value))
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", value).strip(" -|\u00a0")
+
+
 def publisher_key(value):
-    """Like title_key, but also drops generic corporate words ('Games', 'GmbH', ...)."""
-    words = title_key(value).split()
+    """Normalize publisher names while preserving parenthetical aliases."""
+    value = normalize_publisher(value).casefold().replace("&", " and ")
+    words = re.sub(r"[^a-z0-9]+", " ", value).split()
     kept = [w for w in words if w not in GENERIC_PUBLISHER_WORDS]
     return " ".join(kept or words)
 
@@ -290,7 +310,7 @@ def add_tabletop_title(results_by_key, value, publishers=""):
     entry = results_by_key.setdefault(key, {"title": value, "publishers": []})
     raw_publishers = re.split(r"[,;]|\u2022|\s+/\s+", str(publishers or ""))
     for publisher in raw_publishers:
-        publisher = normalize_title(publisher)
+        publisher = normalize_publisher(publisher)
         if publisher and publisher.casefold() not in {p.casefold() for p in entry["publishers"]}:
             entry["publishers"].append(publisher)
 
@@ -317,8 +337,8 @@ def pick_title_column(header):
     return 0
 
 
-def get_preview_games():
-    """Titles already on the BGG Spiel Preview list, including publisher metadata from the CSV."""
+def get_preview_games_from_csv():
+    """Load the bundled CSV to supplement the live Tabletop Together list."""
     path, error = find_preview_csv()
     if error:
         return [], error
@@ -358,6 +378,116 @@ def get_preview_games():
         rows[0][publisher_index] if publisher_index is not None else None,
     )
     return (results, None) if results else ([], f"No titles found in {os.path.basename(path)}.")
+
+
+def parse_tabletop_page(text):
+    """Extract game titles and publisher names from a shared Tabletop Together page."""
+    soup = BeautifulSoup(text, "html.parser")
+    results_by_key = {}
+    for row in soup.select("table tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 2:
+            continue
+        title_node = cells[1].find("strong")
+        if not title_node:
+            continue
+        title = re.sub(r"\s+EXPANSION$", "", title_node.get_text(" ", strip=True), flags=re.IGNORECASE)
+        if not title:
+            continue
+
+        publishers = []
+        details = cells[1].find("small")
+        if details:
+            for child in details.children:
+                if getattr(child, "name", None) == "br":
+                    break
+                if getattr(child, "name", None) == "a":
+                    publishers.append(child.get_text(" ", strip=True))
+        add_tabletop_title(results_by_key, title, ", ".join(publishers))
+
+    return list(results_by_key.values())
+
+
+def merge_tabletop_games(primary, supplemental):
+    """Merge lists by normalized title while retaining publisher variants from both sources."""
+    results_by_key = {}
+    for games in (primary, supplemental):
+        for game in games:
+            add_tabletop_title(
+                results_by_key,
+                game.get("title", ""),
+                ", ".join(game.get("publishers", [])),
+            )
+    return list(results_by_key.values())
+
+
+def load_tabletop_cache():
+    try:
+        with open(TTT_CACHE_FILE, encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        cached_at = float(snapshot["cached_at"])
+        games = snapshot["games"]
+        if not isinstance(games, list) or not games:
+            return None, None
+        return games, cached_at
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+
+
+def save_tabletop_cache(games):
+    temporary_file = f"{TTT_CACHE_FILE}.tmp"
+    try:
+        with open(temporary_file, "w", encoding="utf-8") as fh:
+            json.dump({"cached_at": time.time(), "games": games}, fh, separators=(",", ":"))
+        os.replace(temporary_file, TTT_CACHE_FILE)
+    except OSError:
+        logger.warning("Could not write Tabletop Together cache to %s", TTT_CACHE_FILE)
+        try:
+            os.remove(temporary_file)
+        except OSError:
+            pass
+
+
+def get_preview_games():
+    """Combine the live Tabletop Together share list with the broader bundled CSV."""
+    cached_games, cached_at = load_tabletop_cache()
+    if cached_games is not None and cached_at is not None and time.time() - cached_at < TTT_CACHE_TTL:
+        logger.info("Loaded %d Tabletop Together titles from %s", len(cached_games), TTT_CACHE_FILE)
+        live_games, share_error = cached_games, None
+    else:
+        text, share_error = fetch(TTT_SHARE_URL, "text/html")
+        live_games = parse_tabletop_page(text) if not share_error else []
+        if live_games:
+            save_tabletop_cache(live_games)
+            logger.info("Loaded %d titles from the Tabletop Together share page", len(live_games))
+        else:
+            if not share_error:
+                share_error = "Tabletop Together share page contained no parseable game titles."
+            if cached_games:
+                logger.warning("Using stale Tabletop Together cache because refresh failed: %s", share_error)
+                live_games = cached_games
+
+    csv_games, csv_error = get_preview_games_from_csv()
+    if live_games:
+        games = merge_tabletop_games(live_games, csv_games)
+        warnings = []
+        if share_error:
+            warnings.append(f"Share-page refresh failed; using cached data. {share_error}")
+        if csv_error:
+            logger.warning("Could not supplement Tabletop Together data with the bundled CSV: %s", csv_error)
+            warnings.append(f"Bundled CSV supplement unavailable: {csv_error}")
+        if warnings:
+            return games, " ".join(warnings)
+        logger.info(
+            "Using %d unique titles from the Tabletop Together page and CSV",
+            len(games),
+        )
+        return games, None
+    if csv_games:
+        logger.warning("Using bundled CSV because the Tabletop Together share page failed: %s", share_error)
+        return csv_games, f"{share_error} Using bundled CSV fallback."
+    errors = [error for error in (share_error, csv_error) if error]
+    return [], " ".join(errors) or "Tabletop Together data is unavailable."
 
 
 # --- Manual BGG overrides -----------------------------------------------------
@@ -517,7 +647,7 @@ def cached_data(name, loader):
         with _cache_lock:
             if error and data:
                 logger.warning("Using stale cache for %s because refresh failed: %s", name, error)
-                _cache[name] = (timestamp, data, error)
+                _cache[name] = (time.monotonic(), data, error)
                 return data, error
             _cache[name] = (time.monotonic(), data, error)
         return data, error
@@ -896,7 +1026,54 @@ def _match_cache_signature(spiel_titles, tabletop_titles):
         (t["title"], tuple(sorted(publisher_key(p) for p in t.get("publishers", []))))
         for t in tabletop_titles
     )
-    return hash((spiel_sig, tabletop_sig))
+    signature_data = json.dumps((spiel_sig, tabletop_sig), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(signature_data.encode("utf-8")).hexdigest()
+
+
+def load_match_cache(signature, expected_rows):
+    try:
+        with open(MATCH_CACHE_FILE, encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        cached_at = float(snapshot["cached_at"])
+        rows = snapshot["rows"]
+        if (
+            snapshot["signature"] != signature
+            or time.time() - cached_at >= MATCH_CACHE_TTL
+            or not isinstance(rows, list)
+            or len(rows) != expected_rows
+            or any(
+                not isinstance(row, list)
+                or len(row) != 4
+                or not isinstance(row[0], str)
+                or row[1] not in {"match", "possible match", "not found"}
+                or (row[2] is not None and not isinstance(row[2], str))
+                or not isinstance(row[3], int)
+                for row in rows
+            )
+        ):
+            return None
+        logger.info("Loaded %d SPIEL-to-TTT matches from %s", len(rows), MATCH_CACHE_FILE)
+        return [tuple(row) for row in rows]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_match_cache(signature, rows):
+    temporary_file = f"{MATCH_CACHE_FILE}.tmp"
+    try:
+        with open(temporary_file, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"cached_at": time.time(), "signature": signature, "rows": rows},
+                fh,
+                separators=(",", ":"),
+            )
+        os.replace(temporary_file, MATCH_CACHE_FILE)
+    except OSError:
+        logger.warning("Could not write SPIEL-to-TTT match cache to %s", MATCH_CACHE_FILE)
+        try:
+            os.remove(temporary_file)
+        except OSError:
+            pass
 
 
 def _publisher_match_score(spiel_publishers, tabletop_publishers):
@@ -915,7 +1092,7 @@ def _publisher_compatible(spiel_publishers, tabletop_publishers):
 
 def fuzzy_matches(spiel_titles, tabletop_titles):
     """
-    Match SPIEL titles to the Tabletop Together CSV using BOTH title and publisher.
+    Match SPIEL titles to the Tabletop Together share page and bundled CSV using title and publisher.
 
     Exact title matches are accepted only when the publisher agrees (or one side has no
     publisher). Fuzzy matches require a strong publisher match. This prevents generic
@@ -926,6 +1103,10 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
     with _match_lock:
         if _match_cache["sig"] == sig:
             return _match_cache["rows"]
+        cached_rows = load_match_cache(sig, len(spiel_titles))
+        if cached_rows is not None:
+            _match_cache["sig"], _match_cache["rows"] = sig, cached_rows
+            return cached_rows
 
     started = time.monotonic()
     display = [normalize_title(item["title"]) for item in tabletop_titles]
@@ -1010,6 +1191,7 @@ def fuzzy_matches(spiel_titles, tabletop_titles):
 
     with _match_lock:
         _match_cache["sig"], _match_cache["rows"] = sig, rows
+        save_match_cache(sig, rows)
     logger.info(
         "Publisher-aware matched %d SPIEL titles against %d preview titles in %.1fs",
         len(spiel_titles), len(tabletop_titles), time.monotonic() - started
@@ -1124,7 +1306,7 @@ def index():
     # If either source failed, matches is empty and NO BGG calls are made (never fall back to looking up everything).
     delta = delta_games(spiel, matches, overrides) if matches else []
     ensure_bgg_worker(delta)
-    # Only novelties that are NOT already on the CSV are listed. Add ?all=1 to the URL to see every row (for debugging).
+    # Only novelties that are NOT already on the Tabletop Together list are listed. Add ?all=1 to the URL to see every row (for debugging).
     show_all = request.args.get("all") == "1"
     rows = matches if show_all else [m for m in matches if m["status"] in BGG_LOOKUP_STATUSES]
 
@@ -1140,10 +1322,10 @@ def index():
 body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}th{background:#f2f2f2}.warning{color:#8a3b00;background:#fff3e0;padding:10px;border:1px solid #f0d7a0}.muted{color:#555}.badge{display:inline-block;padding:2px 6px;border-radius:10px;font-size:12px;font-weight:bold}.badge.search{background:#eef5ff;color:#2455a0}.badge.direct{background:#eafaf1;color:#1f7a47}.badge.override{background:#fff4cc;color:#7a5a00}.small{font-size:12px}.status{font-weight:bold}.status.match{color:#18672d}.status.possible{color:#8a3b00}.status.notfound{color:#8a1c1c}.clickable{cursor:pointer}
 </style></head><body><h1>SPIEL novelties not on the Tabletop Together list</h1>
 {% if spiel_error %}<div class="warning">SPIEL data unavailable: {{ spiel_error }}</div>{% endif %}
-{% if tabletop_error %}<div class="warning">Preview list (CSV) unavailable: {{ tabletop_error }}</div>{% endif %}
+{% if tabletop_error %}<div class="warning">Tabletop Together data notice: {{ tabletop_error }}</div>{% endif %}
 {% if overrides_error %}<div class="warning">BGG override CSV problem: {{ overrides_error }}</div>{% endif %}
 {% if bgg_disabled_reason %}<div class="warning">BGG direct links disabled: {{ bgg_disabled_reason }}. Showing search links.</div>{% endif %}
-<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together CSV titles: {{ tabletop_count }}{% if matches %} | Not on the CSV (shown below): {{ delta_count }}{% endif %}{% if overrides_count %} | Manual overrides loaded: {{ overrides_count }}{% endif %}{% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
+<p>SPIEL novelties: {{ spiel_count }} | Tabletop Together titles: {{ tabletop_count }}{% if matches %} | Not on the list (shown below): {{ delta_count }}{% endif %}{% if overrides_count %} | Manual overrides loaded: {{ overrides_count }}{% endif %}{% if bgg_token %} | BGG lookups: {{ bgg_resolved }}/{{ delta_count }} ({{ bgg_direct }} direct){% if bgg_pending %} &ndash; still working, page refreshes automatically{% endif %}
 {% else %} | BGG direct links off (set BGG_API_TOKEN to enable){% endif %}</p>
 {% if matches and not rows %}<p>Every SPIEL novelty is already on the Tabletop Together list.</p>{% endif %}
 {% if rows %}<p><small>Click a column heading to sort.</small></p>
